@@ -13,7 +13,9 @@ void train(int epochs, int batch_size, float learning_rate) {
     std::cout << "Done. Training samples: " << dataset.train_data.cols() << std::endl;
 
     std::cout << "Creating Modern VGG-style network..." << std::endl;
-    Network dnn = createModernNet_CPU();
+    // Hybrid training: GPU forward (Conv_Custom), CPU backward/update.
+    Conv_Custom::verbose = false;  // silence per-conv timing spam during training
+    Network dnn = createModernNet_CUDA();
     std::cout << "Done" << std::endl;
 
     // Optimizer
@@ -21,6 +23,12 @@ void train(int epochs, int batch_size, float learning_rate) {
 
     // Training loop
     int n_batch = dataset.train_data.cols() / batch_size;
+
+    // CSV logs for plotting later
+    std::ofstream loss_log("./build/training_loss.csv");
+    loss_log << "epoch,batch,global_step,loss\n";
+    std::ofstream acc_log("./build/epoch_accuracy.csv");
+    acc_log << "epoch,test_accuracy\n";
 
     for (int epoch = 0; epoch < epochs; epoch++) {
         shuffle_data(dataset.train_data, dataset.train_labels);
@@ -40,7 +48,12 @@ void train(int epochs, int batch_size, float learning_rate) {
             dnn.backward(batch_data, batch_onehot);
             dnn.update(opt);
 
-            total_loss += dnn.get_loss();
+            float cur_loss = dnn.get_loss();
+            total_loss += cur_loss;
+
+            // Log instantaneous per-batch loss for plotting
+            loss_log << epoch + 1 << "," << batch + 1 << ","
+                     << epoch * n_batch + batch << "," << cur_loss << "\n";
 
             if (batch == 0 || (batch + 1) % 10 == 0) {
                 std::cout << "\rEpoch " << epoch + 1 << "/" << epochs
@@ -54,6 +67,9 @@ void train(int epochs, int batch_size, float learning_rate) {
         float acc = compute_accuracy(dnn.output(), dataset.test_labels);
         std::cout << "\nEpoch " << epoch + 1 << " complete. Test Accuracy: "
                   << acc * 100 << "%" << std::endl;
+        acc_log << epoch + 1 << "," << acc << "\n";
+        loss_log.flush();
+        acc_log.flush();
     }
 
     // Save trained weights

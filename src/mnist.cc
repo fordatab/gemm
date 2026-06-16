@@ -38,7 +38,7 @@ void MNIST::read_mnist_data(std::string filename, Matrix& data, int batch_size) 
         for (int c = 0; c < n_cols; c++) {
           unsigned char image = 0;
           file.read((char*)&image, sizeof(image));
-          data(r * n_cols + c, i) = (float)image;
+          data(r * n_cols + c, i) = (float)image / 255.0f;  // normalize to [0,1]
         }
       }
     }

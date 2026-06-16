@@ -36,6 +36,10 @@ class Conv_Custom: public Layer {
   void init();
 
  public:
+  // Per-call forward timing prints are useful for profiling a single inference
+  // pass, but flood the console during training. Set false to silence them.
+  static bool verbose;
+
   Conv_Custom(int channel_in, int height_in, int width_in, int channel_out,
        int height_kernel, int width_kernel, int stride = 1, int pad_w = 0,
        int pad_h = 0) :
@@ -48,6 +52,8 @@ class Conv_Custom: public Layer {
   void forward(const Matrix& bottom);
   void backward(const Matrix& bottom, const Matrix& grad_top);
   void update(Optimizer& opt);
+  void im2col(const Vector& image, Matrix& data_col);
+  void col2im(const Matrix& data_col, Vector& image);
   int output_dim() { return dim_out; }
   std::vector<float> get_parameters() const;
   std::vector<float> get_derivatives() const;

@@ -1,12 +1,14 @@
 #include "./fully_connected.h"
+#include <cmath>
 
 void FullyConnected::init() {
   weight.resize(dim_in, dim_out);
   bias.resize(dim_out);
   grad_weight.resize(dim_in, dim_out);
   grad_bias.resize(dim_out);
-  set_normal_random(weight.data(), weight.size(), 0, 0.01);
-  set_normal_random(bias.data(), bias.size(), 0, 0.01);
+  // He initialization (ReLU): std = sqrt(2 / fan_in)
+  set_normal_random(weight.data(), weight.size(), 0, std::sqrt(2.0f / dim_in));
+  bias.setZero();
 }
 
 void FullyConnected::forward(const Matrix& bottom) {

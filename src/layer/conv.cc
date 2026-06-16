@@ -11,8 +11,10 @@ void Conv::init() {
   bias.resize(channel_out);
   grad_weight.resize(channel_in * height_kernel * width_kernel, channel_out);
   grad_bias.resize(channel_out);
-  set_normal_random(weight.data(), weight.size(), 0, 0.01);
-  set_normal_random(bias.data(), bias.size(), 0, 0.01);
+  // He initialization (ReLU): std = sqrt(2 / fan_in)
+  float fan_in = channel_in * height_kernel * width_kernel;
+  set_normal_random(weight.data(), weight.size(), 0, sqrtf(2.0f / fan_in));
+  bias.setZero();
   //std::cout << weight.colwise().sum() << std::endl;
   //std::cout << weight.colwise().sum() + bias.transpose() << std::endl;
 }
