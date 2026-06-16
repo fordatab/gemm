@@ -32,14 +32,17 @@ void train(int epochs, int batch_size, float learning_rate) {
                                     dataset.train_data.rows(), batch_size);
             Matrix batch_labels = dataset.train_labels.block(0, start,
                                     dataset.train_labels.rows(), batch_size);
+            // Loss expects one-hot targets (n_classes x batch), but labels are
+            // stored as raw class indices (1 x batch).
+            Matrix batch_onehot = one_hot_encode(batch_labels, 10);
 
             dnn.forward(batch_data);
-            dnn.backward(batch_data, batch_labels);
+            dnn.backward(batch_data, batch_onehot);
             dnn.update(opt);
 
             total_loss += dnn.get_loss();
 
-            if ((batch + 1) % 10 == 0) {
+            if (batch == 0 || (batch + 1) % 10 == 0) {
                 std::cout << "\rEpoch " << epoch + 1 << "/" << epochs
                           << " | Batch " << batch + 1 << "/" << n_batch
                           << " | Loss: " << total_loss / (batch + 1) << std::flush;

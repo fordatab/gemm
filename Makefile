@@ -26,23 +26,14 @@ endif
 LDFLAGS += $(CUDA_LIB)
 INCFLAGS += $(CUDA_INC)
 
-all: m2 m1 modern
+all: modern
 
-m2:		m2.o ece408net.o src/network.o src/mnist.o layer.sentinel loss.sentinel cuda.sentinel
-		$(NVCC) $(NVCCFLAGS) -o m2 m2.o ece408net.o src/network.o src/mnist.o src/layer/*.o src/loss/*.o src/layer/custom/*.o $(LDFLAGS)
-
-m1:		m1.o ece408net.o src/network.o src/mnist.o layer.sentinel loss.sentinel cuda.sentinel
-		$(NVCC) $(NVCCFLAGS) -o m1 m1.o ece408net.o src/network.o src/mnist.o src/layer/*.o src/loss/*.o src/layer/custom/*.o $(LDFLAGS)
-
-m2.o:		m2.cc
-		$(CC) $(CFLAGS) -c m2.cc -o m2.o $(INCFLAGS)
-
-m1.o:		m1.cc
-		$(CC) $(CFLAGS) -c m1.cc -o m1.o $(INCFLAGS)
-
-# Modern VGG-style network
-modern:		modern_main.o modernnet.o src/network.o src/mnist.o layer.sentinel loss.sentinel cuda.sentinel
-		$(NVCC) $(NVCCFLAGS) -o modern modern_main.o modernnet.o src/network.o src/mnist.o src/layer/*.o src/loss/*.o src/layer/custom/*.o $(LDFLAGS)
+# Modern VGG-style network.
+# A single 'modern' binary supports both inference paths (selected at runtime):
+#   cpu  -> createModernNet_CPU()  : uses Conv        (CPU baseline)
+#   cuda -> createModernNet_CUDA() : uses Conv_Custom (custom GPU kernel)
+modern:		modern_main.o modernnet.o src/network.o src/mnist.o src/optimizer/sgd.o layer.sentinel loss.sentinel cuda.sentinel
+		$(NVCC) $(NVCCFLAGS) -o modern modern_main.o modernnet.o src/network.o src/mnist.o src/optimizer/sgd.o src/layer/*.o src/loss/*.o src/layer/custom/*.o $(LDFLAGS)
 
 modern_main.o:	modern_main.cc
 		$(CC) $(CFLAGS) -c modern_main.cc -o modern_main.o $(INCFLAGS)
@@ -50,14 +41,14 @@ modern_main.o:	modern_main.cc
 modernnet.o:	modernnet.cc
 		$(CC) $(CFLAGS) -c modernnet.cc -o modernnet.o $(INCFLAGS)
 
-ece408net.o:    ece408net.cc
-		$(CC) $(CFLAGS) -c ece408net.cc -o ece408net.o $(INCFLAGS)
-
 src/network.o:	src/network.cc
 		$(CC) $(CFLAGS) -c src/network.cc -o src/network.o $(INCFLAGS)
 
 src/mnist.o:	src/mnist.cc
 		$(CC) $(CFLAGS) -c src/mnist.cc -o src/mnist.o $(INCFLAGS)
+
+src/optimizer/sgd.o:	src/optimizer/sgd.cc
+		$(CC) $(CFLAGS) -c src/optimizer/sgd.cc -o src/optimizer/sgd.o $(INCFLAGS)
 
 layer.sentinel:		src/layer/conv.cc src/layer/ave_pooling.cc src/layer/fully_connected.cc src/layer/max_pooling.cc src/layer/relu.cc src/layer/sigmoid.cc src/layer/softmax.cc
 		$(CC) $(CFLAGS) -c src/layer/ave_pooling.cc -o src/layer/ave_pooling.o $(INCFLAGS)
@@ -82,30 +73,29 @@ loss.sentinel:           src/loss/cross_entropy_loss.cc src/loss/mse_loss.cc
 clean:
 		find . -name "*.o" -type f -delete
 		rm -f *.sentinel
-		rm -f m2 || true
-		rm -f m1 || true
 		rm -f modern || true
 
-cpu:		m1
-		./m1 1000
+# Convenience run targets (single 'modern' binary, path chosen at runtime)
 
-gpu: 		m2
-		./m2 1000
+# CPU inference (Conv baseline)
+cpu:		modern
+		./modern cpu --batch 1000
 
-time: time_gpu
+# Custom GPU-kernel inference (Conv_Custom)
+gpu:		modern
+		./modern cuda --batch 1000
 
-time_gpu: 		m2
-		python3 ../utils/profile.py  --args ./m2 1000
-
-time_cpu: 	m1
-		python3 ../utils/profile.py  --args ./m1 1000
-
-# Modern network targets
 modern_train:	modern
 		./modern train --epochs 10 --batch 128
 
-modern_cpu:	modern
-		./modern cpu --batch 1000
+modern_cpu:	cpu
 
-modern_cuda:	modern
-		./modern cuda --batch 1000
+modern_cuda:	gpu
+
+time: time_gpu
+
+time_gpu:	modern
+		python3 ../utils/profile.py  --args ./modern cuda --batch 1000
+
+time_cpu:	modern
+		python3 ../utils/profile.py  --args ./modern cpu --batch 1000
