@@ -3,7 +3,7 @@ NVCC     = nvcc
 CFLAGS   = -O3 -march=native -DNDEBUG -funroll-loops -fopenmp -Wall
 NVCCFLAGS = -g -O2
 INCFLAGS := -I.
-LDFLAGS  := -lm
+LDFLAGS  := -lm -lgomp
 
 # CUDA paths and libraries
 CUDA_PATH ?= /usr/local/cuda
