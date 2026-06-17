@@ -19,7 +19,11 @@ import urllib.request
 import numpy as np
 from PIL import Image
 
-OUT_DIR = "data"
+# This script lives in <repo>/utils/, so the repo root is one level up.
+# Resolve the output dir relative to the repo root so it always writes to
+# <repo>/data regardless of the current working directory.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(REPO_ROOT, "data")
 SIZE = 86
 MIRRORS = [
     "https://github.com/zalandoresearch/fashion-mnist/raw/master/data/fashion/",

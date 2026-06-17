@@ -95,7 +95,7 @@ modern_cuda:	gpu
 time: time_gpu
 
 time_gpu:	modern
-		python3 ../utils/profile.py  --args ./modern cuda --batch 1000
+		python3 utils/profile.py  --args ./modern cuda --batch 1000
 
 time_cpu:	modern
-		python3 ../utils/profile.py  --args ./modern cpu --batch 1000
+		python3 utils/profile.py  --args ./modern cpu --batch 1000

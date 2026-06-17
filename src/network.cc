@@ -117,14 +117,14 @@ void Network::save_parameters(std::string filename) {
 
   int n_layer = layers.size();
   out.write(reinterpret_cast<char*>(&n_layer), sizeof(int));
-  std::cout<<"Num Layers: "<<n_layer<<std::endl;
+  // std::cout<<"Num Layers: "<<n_layer<<std::endl;
   std::vector< std::vector<float> > res;
   res.reserve(n_layer);
 
   for (int i = 0; i < n_layer; i++) {
     std::vector<float> layer_params = layers[i]->get_parameters();
     int layer_p_size = layer_params.size();
-    std::cout<<"Layer "<<i<<" size: "<<layer_p_size<<std::endl;
+    // std::cout<<"Layer "<<i<<" size: "<<layer_p_size<<std::endl;
     out.write(reinterpret_cast<char*>(&layer_p_size), sizeof(int));
 
     for (int j = 0; j < layer_p_size; j++) {

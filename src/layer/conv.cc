@@ -62,7 +62,12 @@ void Conv::forward(const Matrix& bottom) {
     data_cols[i] = data_col;
     // conv by product
     Matrix result = data_col * weight;  // result: (hw_out, channel_out)
-    result.rowwise() += bias.transpose();
+    // NOTE: bias intentionally NOT added here. The GPU Conv_Custom forward
+    // (used for training) computes only the convolution, so the trained conv
+    // weights are biasless. Adding bias here would diverge from the GPU path
+    // and corrupt inference. Keep this disabled unless the model is retrained
+    // with bias enabled on both paths.
+    // result.rowwise() += bias.transpose();
     top.col(i) = Eigen::Map<Vector>(result.data(), result.size());
   }
 }
