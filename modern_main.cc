@@ -62,9 +62,28 @@ void train(int epochs, int batch_size, float learning_rate) {
             }
         }
 
-        // Validation accuracy
-        dnn.forward(dataset.test_data);
-        float acc = compute_accuracy(dnn.output(), dataset.test_labels);
+        // Validation accuracy.
+        // Forward the test set in chunks instead of all 10k at once: the GPU
+        // conv path allocates im2col/output buffers sized for the whole batch,
+        // and a single 10k-wide forward overflows VRAM on the deeper, high-
+        // channel conv layers. Chunking keeps each forward within device memory.
+        int n_test = dataset.test_data.cols();
+        int val_batch = batch_size;
+        int correct = 0;
+        for (int start = 0; start < n_test; start += val_batch) {
+            int cur = (n_test - start < val_batch) ? (n_test - start) : val_batch;
+            Matrix chunk = dataset.test_data.block(0, start,
+                                dataset.test_data.rows(), cur);
+            dnn.forward(chunk);
+            const Matrix& preds = dnn.output();
+            Matrix chunk_labels = dataset.test_labels.block(0, start, 1, cur);
+            for (int i = 0; i < cur; i++) {
+                Matrix::Index max_index;
+                preds.col(i).maxCoeff(&max_index);
+                correct += (int(max_index) == chunk_labels(i));
+            }
+        }
+        float acc = static_cast<float>(correct) / n_test;
         std::cout << "\nEpoch " << epoch + 1 << " complete. Test Accuracy: "
                   << acc * 100 << "%" << std::endl;
         acc_log << epoch + 1 << "," << acc << "\n";
