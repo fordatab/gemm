@@ -1,6 +1,6 @@
 CC       = g++
 NVCC     = nvcc
-CFLAGS   = -O3 -march=native -DNDEBUG -funroll-loops -fopenmp -Wall
+CFLAGS   = -O3 -DNDEBUG -funroll-loops -fopenmp -Wall
 NVCCFLAGS = -g -O2
 INCFLAGS := -I.
 LDFLAGS  := -lm -lgomp
