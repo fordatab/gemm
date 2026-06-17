@@ -10,18 +10,6 @@ CUDA_PATH ?= /usr/local/cuda
 CUDA_INC  = -I"$(CUDA_PATH)/include"
 CUDA_LIB  = -L"$(CUDA_PATH)/lib64" -lcudart -lcublas
 
-ifeq ($(shell uname -o 2>/dev/null), Darwin)
-	# macOS - use default CUDA installation
-	CUDA_LIB = -L/usr/local/cuda/lib -lcudart -lcublas
-else ifeq ($(shell uname -o 2>/dev/null), GNU/Linux)
-	# Linux with NVIDIA GPU
-	CUDA_LIB = -L"$(CUDA_PATH)/lib64" -lcudart -lcublas
-	CUDA_INC = -I"$(CUDA_PATH)/include"
-else
-	# Windows with NVIDIA GPU
-	CUDA_LIB = -L"$(CUDA_PATH)/lib/x64" -lcudart -lcublas
-	CUDA_INC = -I"$(CUDA_PATH)/include"
-endif
 
 LDFLAGS += $(CUDA_LIB)
 INCFLAGS += $(CUDA_INC)
