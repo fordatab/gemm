@@ -21,7 +21,7 @@ all: modern
 #   cpu  -> createModernNet_CPU()  : uses Conv        (CPU baseline)
 #   cuda -> createModernNet_CUDA() : uses Conv_Custom (custom GPU kernel)
 modern:		modern_main.o modernnet.o src/network.o src/mnist.o src/optimizer/sgd.o layer.sentinel loss.sentinel cuda.sentinel
-		$(NVCC) $(NVCCFLAGS) -o modern modern_main.o modernnet.o src/network.o src/mnist.o src/optimizer/sgd.o src/layer/*.o src/loss/*.o src/layer/custom/*.o $(LDFLAGS)
+		$(NVCC) $(NVCCFLAGS) -o modern modern_main.o modernnet.o src/network.o src/mnist.o src/optimizer/sgd.o src/layer/*.o src/loss/*.o src/layer/kernel/*.o $(LDFLAGS)
 
 modern_main.o:	modern_main.cc
 		$(CC) $(CFLAGS) -c modern_main.cc -o modern_main.o $(INCFLAGS)
@@ -48,8 +48,8 @@ layer.sentinel:		src/layer/conv.cc src/layer/ave_pooling.cc src/layer/fully_conn
 		$(CC) $(CFLAGS) -c src/layer/softmax.cc -o src/layer/softmax.o $(INCFLAGS)
 		touch layer.sentinel
 
-cuda.sentinel: src/layer/custom/new-forward.cu src/layer/custom/gpu-utils.cuh src/layer/conv_cust.cc
-		$(NVCC) $(NVCCFLAGS) -c src/layer/custom/new-forward.cu -o src/layer/custom/new-forward.o $(INCFLAGS)
+cuda.sentinel: src/layer/kernel/new-forward.cu src/layer/kernel/gpu-utils.cuh src/layer/conv_cust.cc
+		$(NVCC) $(NVCCFLAGS) -c src/layer/kernel/new-forward.cu -o src/layer/kernel/new-forward.o $(INCFLAGS)
 		$(NVCC) $(NVCCFLAGS) -x cu -c src/layer/conv_cust.cc -o src/layer/conv_cust.o $(INCFLAGS)
 		touch cuda.sentinel
 
@@ -69,9 +69,13 @@ clean:
 cpu:		modern
 		./modern cpu --batch 1000
 
-# Custom GPU-kernel inference (Conv_Custom)
+# Custom GPU inference, im2col + cuBLAS GEMM (Conv_Custom)
 gpu:		modern
 		./modern cuda --batch 1000
+
+# Custom GPU inference, direct convolution kernel (Conv_Custom)
+gpu_direct:	modern
+		./modern direct --batch 1000
 
 modern_train:	modern
 		./modern train --epochs 10 --batch 128
@@ -84,6 +88,9 @@ time: time_gpu
 
 time_gpu:	modern
 		python3 utils/profile.py  --args ./modern cuda --batch 1000
+
+time_gpu_direct:	modern
+		python3 utils/profile.py  --args ./modern direct --batch 1000
 
 time_cpu:	modern
 		python3 utils/profile.py  --args ./modern cpu --batch 1000

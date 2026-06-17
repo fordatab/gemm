@@ -131,7 +131,9 @@ void inference_cuda(int batch_size) {
     dataset.read_test_data(batch_size);
     std::cout << "Done" << std::endl;
 
-    std::cout << "Loading Modern network (CUDA)..." << std::endl;
+    const char* impl = Conv_Custom::use_direct ? "direct kernel"
+                                               : "im2col + cuBLAS GEMM";
+    std::cout << "Loading Modern network (CUDA, " << impl << ")..." << std::endl;
     Network dnn = createModernNet_CUDA();
 
     // Try to load pre-trained weights
@@ -159,7 +161,8 @@ void print_usage(const char* prog) {
     std::cout << "Modes:" << std::endl;
     std::cout << "  train    Train the network" << std::endl;
     std::cout << "  cpu      Run inference on CPU" << std::endl;
-    std::cout << "  cuda     Run inference on CUDA GPU" << std::endl;
+    std::cout << "  cuda     Run inference on GPU (im2col + cuBLAS GEMM)" << std::endl;
+    std::cout << "  direct   Run inference on GPU (direct conv kernel)" << std::endl;
     std::cout << std::endl;
     std::cout << "Options for train mode:" << std::endl;
     std::cout << "  --epochs N       Number of epochs (default: 10)" << std::endl;
@@ -213,8 +216,14 @@ int main(int argc, char* argv[]) {
         std::cout << "Test batch size: " << test_batch << std::endl;
         inference_cpu(test_batch);
     } else if (mode == "cuda") {
-        std::cout << "=== Modern VGG-style CNN Inference (CUDA) ===" << std::endl;
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: im2col + GEMM) ===" << std::endl;
         std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::use_direct = false;
+        inference_cuda(test_batch);
+    } else if (mode == "direct") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct conv kernel) ===" << std::endl;
+        std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::use_direct = true;
         inference_cuda(test_batch);
     } else {
         std::cerr << "Unknown mode: " << mode << std::endl;
