@@ -4,7 +4,7 @@
 #include <vector>
 #include <chrono>
 #include "../layer.h"
-#include "./custom/gpu-utils.cuh"
+#include "./kernel/gpu-utils.cuh"
 
 class Conv_Custom: public Layer {
  private:
@@ -39,6 +39,11 @@ class Conv_Custom: public Layer {
   // Per-call forward timing prints are useful for profiling a single inference
   // pass, but flood the console during training. Set false to silence them.
   static bool verbose;
+
+  // Selects the GPU forward implementation:
+  //   false -> im2col + cuBLAS GEMM (default)
+  //   true  -> direct convolution kernel
+  static bool use_direct;
 
   Conv_Custom(int channel_in, int height_in, int width_in, int channel_out,
        int height_kernel, int width_kernel, int stride = 1, int pad_w = 0,

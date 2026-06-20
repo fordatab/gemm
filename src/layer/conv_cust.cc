@@ -3,6 +3,7 @@
 #include <iostream>
 
 bool Conv_Custom::verbose = true;
+bool Conv_Custom::use_direct = false;
 
 void Conv_Custom::init()
 {
@@ -38,22 +39,29 @@ void Conv_Custom::forward(const Matrix &bottom)
   const int K = height_kernel; // Assuming width_kernel is also K
 
   float *x_d;
-  float *x_unroll_d;
+  float *x_unroll_d = nullptr;
   float *y_d;
   float *k_d;
 
   if (verbose)
-    std::cout << "Conv-CUDA==" << std::endl;
+    std::cout << (use_direct ? "Conv-CUDA(direct)==" : "Conv-CUDA(im2col+gemm)==")
+              << std::endl;
 
   // Start layer timer
   auto start_time_layer = std::chrono::high_resolution_clock::now();
-  // Data transfer CPU to GPU
-  cudaInterface.conv_forward_cuda_prolog(y, x, k, &y_d, &x_d, &k_d, &x_unroll_d, B, M, C, height_in, width_in, K);
+  // Data transfer CPU to GPU. The direct path doesn't need the unrolled buffer,
+  // so pass a null out-pointer to skip its (large) allocation.
+  cudaInterface.conv_forward_cuda_prolog(y, x, k, &y_d, &x_d, &k_d,
+                                         use_direct ? nullptr : &x_unroll_d,
+                                         B, M, C, height_in, width_in, K);
 
   // Start kernel timer
   auto start_time_kernel = std::chrono::high_resolution_clock::now();
-  // Hand off to GPU for computation
-  cudaInterface.conv_forward_cuda(y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
+  // Hand off to GPU for computation: either a direct conv kernel or im2col+GEMM.
+  if (use_direct)
+    cudaInterface.conv_forward_cuda_direct(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+  else
+    cudaInterface.conv_forward_cuda(y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
   // Stop kernel timer
   auto end_time_kernel = std::chrono::high_resolution_clock::now();
 
