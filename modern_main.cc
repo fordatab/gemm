@@ -125,15 +125,14 @@ void inference_cpu(int batch_size) {
     std::cout << std::endl;
 }
 
-void inference_cuda(int batch_size) {
+void inference_cuda(int batch_size, int iters) {
     std::cout << "Loading Fashion-MNIST test data..." << std::endl;
     MNIST dataset("./data/");
     dataset.read_test_data(batch_size);
     std::cout << "Done" << std::endl;
 
-    const char* impl = Conv_Custom::use_direct ? "direct kernel"
-                                               : "im2col + cuBLAS GEMM";
-    std::cout << "Loading Modern network (CUDA, " << impl << ")..." << std::endl;
+    std::cout << "Loading Modern network (CUDA, " << Conv_Custom::method_name()
+              << ")..." << std::endl;
     Network dnn = createModernNet_CUDA();
 
     // Try to load pre-trained weights
@@ -146,8 +145,23 @@ void inference_cuda(int batch_size) {
         std::cout << "No pre-trained weights found, using random initialization" << std::endl;
     }
 
-    std::cout << "Running inference..." << std::endl;
+    std::cout << "Running inference (" << iters
+              << " timed iters, +1 warmup)..." << std::endl;
+
+    // Warmup: pay the one-time CUDA context / cuBLAS / PTX-JIT / clock-ramp costs
+    // outside the measured region so they don't land on the first conv layer.
+    Conv_Custom::verbose = false;
+    Conv_Custom::record_timing = false;
     dnn.forward(dataset.test_data);
+
+    // Timed iterations: record per-layer times every pass, then report medians.
+    Conv_Custom::reset_timing();
+    Conv_Custom::record_timing = true;
+    for (int i = 0; i < iters; ++i)
+        dnn.forward(dataset.test_data);
+    Conv_Custom::record_timing = false;
+    Conv_Custom::report_timing();
+
     float acc = compute_accuracy(dnn.output(), dataset.test_labels);
 
     std::cout << std::endl;
@@ -162,7 +176,9 @@ void print_usage(const char* prog) {
     std::cout << "  train    Train the network" << std::endl;
     std::cout << "  cpu      Run inference on CPU" << std::endl;
     std::cout << "  cuda     Run inference on GPU (im2col + cuBLAS GEMM)" << std::endl;
-    std::cout << "  direct   Run inference on GPU (direct conv kernel)" << std::endl;
+    std::cout << "  naive    Run inference on GPU (direct conv kernel, naive)" << std::endl;
+    std::cout << "  tiled    Run inference on GPU (direct conv kernel, shared-mem tiled)" << std::endl;
+    std::cout << "  coarse   Run inference on GPU (direct conv kernel, output-channel reg-tiled)" << std::endl;
     std::cout << std::endl;
     std::cout << "Options for train mode:" << std::endl;
     std::cout << "  --epochs N       Number of epochs (default: 10)" << std::endl;
@@ -171,6 +187,7 @@ void print_usage(const char* prog) {
     std::cout << std::endl;
     std::cout << "Options for inference modes:" << std::endl;
     std::cout << "  --batch N        Test batch size (default: 1000)" << std::endl;
+    std::cout << "  --iters N        Timed iterations for GPU modes, median reported (default: 5)" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
     std::cout << "  " << prog << " train --epochs 20 --batch 64" << std::endl;
@@ -191,6 +208,7 @@ int main(int argc, char* argv[]) {
     int batch_size = 128;
     float learning_rate = 0.01f;
     int test_batch = 1000;
+    int iters = 5;  // timed inference iterations (GPU modes), median reported
 
     // Parse arguments
     for (int i = 2; i < argc; i++) {
@@ -201,6 +219,9 @@ int main(int argc, char* argv[]) {
             test_batch = batch_size;
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             learning_rate = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            iters = atoi(argv[++i]);
+            if (iters < 1) iters = 1;
         }
     }
 
@@ -218,13 +239,23 @@ int main(int argc, char* argv[]) {
     } else if (mode == "cuda") {
         std::cout << "=== Modern VGG-style CNN Inference (CUDA: im2col + GEMM) ===" << std::endl;
         std::cout << "Test batch size: " << test_batch << std::endl;
-        Conv_Custom::use_direct = false;
-        inference_cuda(test_batch);
-    } else if (mode == "direct") {
-        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct conv kernel) ===" << std::endl;
+        Conv_Custom::method = ConvMethod::GEMM;
+        inference_cuda(test_batch, iters);
+    } else if (mode == "naive") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct kernel, naive) ===" << std::endl;
         std::cout << "Test batch size: " << test_batch << std::endl;
-        Conv_Custom::use_direct = true;
-        inference_cuda(test_batch);
+        Conv_Custom::method = ConvMethod::DIRECT_NAIVE;
+        inference_cuda(test_batch, iters);
+    } else if (mode == "tiled") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct kernel, tiled) ===" << std::endl;
+        std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::method = ConvMethod::DIRECT_TILED;
+        inference_cuda(test_batch, iters);
+    } else if (mode == "coarse") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct kernel, coarse reg-tiled) ===" << std::endl;
+        std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::method = ConvMethod::DIRECT_COARSE;
+        inference_cuda(test_batch, iters);
     } else {
         std::cerr << "Unknown mode: " << mode << std::endl;
         print_usage(argv[0]);

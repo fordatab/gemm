@@ -31,10 +31,23 @@ public:
         float *device_y, const float *device_x, const float *device_k, float *device_x_unroll,
         const int B, const int M, const int C, const int H, const int W, const int K);
 
-    // Direct convolution: one CUDA kernel computes the output without im2col or
-    // cuBLAS. Same math/semantics as conv_forward_cuda (valid conv, stride 1,
-    // no bias) so results are bit-comparable; device_x_unroll is unused here.
-    void conv_forward_cuda_direct(
+    // Direct convolution: a single CUDA kernel computes the output without
+    // im2col or cuBLAS. Same math/semantics as conv_forward_cuda (valid conv,
+    // stride 1, no bias) so results are bit-comparable; no unrolled buffer needed.
+    // Two variants: naive (global memory only) and tiled (shared-memory halo).
+    void conv_forward_cuda_direct_naive(
+        float *device_y, const float *device_x, const float *device_k,
+        const int B, const int M, const int C, const int H, const int W, const int K);
+
+    void conv_forward_cuda_direct_tiled(
+        float *device_y, const float *device_x, const float *device_k,
+        const int B, const int M, const int C, const int H, const int W, const int K);
+
+    // Direct convolution with output-channel register tiling: each block stages
+    // the input halo tile into shared memory once and reuses it across a group of
+    // output channels held in per-thread registers, so each input load feeds many
+    // MACs (implicit-GEMM style). Same semantics/result as the variants above.
+    void conv_forward_cuda_direct_coarse(
         float *device_y, const float *device_x, const float *device_k,
         const int B, const int M, const int C, const int H, const int W, const int K);
 

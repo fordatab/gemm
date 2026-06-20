@@ -6,6 +6,14 @@
 #include "../layer.h"
 #include "./kernel/gpu-utils.cuh"
 
+// Selects which GPU forward implementation Conv_Custom uses.
+enum class ConvMethod {
+  GEMM,          // im2col + cuBLAS GEMM (default)
+  DIRECT_NAIVE,  // direct conv kernel, global memory only
+  DIRECT_TILED,  // direct conv kernel, shared-memory halo tiling
+  DIRECT_COARSE  // direct conv kernel, shared input tile + output-channel reg tiling
+};
+
 class Conv_Custom: public Layer {
  private:
   const int dim_in;
@@ -40,10 +48,24 @@ class Conv_Custom: public Layer {
   // pass, but flood the console during training. Set false to silence them.
   static bool verbose;
 
-  // Selects the GPU forward implementation:
-  //   false -> im2col + cuBLAS GEMM (default)
-  //   true  -> direct convolution kernel
-  static bool use_direct;
+  // Selects the GPU forward implementation (see ConvMethod above).
+  static ConvMethod method;
+
+  // Short human-readable name for the active method (for log banners / UI).
+  static const char* method_name();
+
+  // --- Profiling instrumentation -------------------------------------------
+  // When record_timing is true, each forward() appends its CUDA-event-measured
+  // GPU op time and its end-to-end layer time to per-instance buffers. Conv
+  // layers register themselves (in construction = network order) so the driver
+  // can emit a clean median-per-layer summary after many iterations, instead of
+  // reporting a single noisy, cold-start-contaminated run.
+  static bool record_timing;
+  static std::vector<Conv_Custom*> instances;
+  std::vector<float> op_ms;     // GPU compute time per timed forward (CUDA events)
+  std::vector<float> layer_ms;  // end-to-end layer time per timed forward (chrono)
+  static void reset_timing();   // clear all instances' recorded times
+  static void report_timing();  // print median per-layer (profiler-scrapable lines)
 
   Conv_Custom(int channel_in, int height_in, int width_in, int channel_out,
        int height_kernel, int width_kernel, int stride = 1, int pad_w = 0,
