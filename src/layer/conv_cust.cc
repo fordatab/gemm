@@ -144,6 +144,21 @@ void Conv_Custom::forward(const Matrix &bottom)
   // Stop layer timer
   auto end_time_layer = std::chrono::high_resolution_clock::now();
 
+  // Add per-output-channel bias (broadcast over spatial positions and samples).
+  // The GPU kernels all compute a *pure* convolution; bias is folded in here so
+  // every method (GEMM/naive/tiled/coarse) computes a standard conv+bias forward
+  // and is comparable to the PyTorch reference, whose Conv2d carries a bias term.
+  // `top` is (channel_out * height_out * width_out) x n_sample, channel-major
+  // within each sample column, so channel m occupies one contiguous hw_out block.
+  // Done after the timer above so the kernel/transfer numbers stay a pure-conv
+  // measurement; the following ReLU layer then applies the activation.
+  {
+    int hw_out = height_out * width_out;
+    for (int s = 0; s < n_sample; ++s)
+      for (int m = 0; m < channel_out; ++m)
+        top.block(m * hw_out, s, hw_out, 1).array() += bias(m);
+  }
+
   std::chrono::duration<float, std::milli> duration_layer = (end_time_layer - start_time_layer);
   if (record_timing) {
     op_ms.push_back(duration_kernel);
