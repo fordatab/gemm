@@ -73,9 +73,17 @@ cpu:		modern
 gpu:		modern
 		./modern cuda --batch 1000
 
-# Custom GPU inference, direct convolution kernel (Conv_Custom)
-gpu_direct:	modern
-		./modern direct --batch 1000
+# Custom GPU inference, direct convolution kernel — naive (Conv_Custom)
+gpu_naive:	modern
+		./modern naive --batch 1000
+
+# Custom GPU inference, direct convolution kernel — shared-mem tiled (Conv_Custom)
+gpu_tiled:	modern
+		./modern tiled --batch 1000
+
+# Custom GPU inference, direct convolution kernel — output-channel reg-tiled (Conv_Custom)
+gpu_coarse:	modern
+		./modern coarse --batch 1000
 
 modern_train:	modern
 		./modern train --epochs 10 --batch 128
@@ -87,10 +95,16 @@ modern_cuda:	gpu
 time: time_gpu
 
 time_gpu:	modern
-		python3 utils/profile.py  --args ./modern cuda --batch 1000
+		python3 utils/profile.py  --args ./modern cuda --batch 1000 --iters 20
 
-time_gpu_direct:	modern
-		python3 utils/profile.py  --args ./modern direct --batch 1000
+time_gpu_naive:	modern
+		python3 utils/profile.py  --args ./modern naive --batch 1000 --iters 20
+
+time_gpu_tiled:	modern
+		python3 utils/profile.py  --args ./modern tiled --batch 1000 --iters 20
+
+time_gpu_coarse:	modern
+		python3 utils/profile.py  --args ./modern coarse --batch 1000 --iters 20
 
 time_cpu:	modern
 		python3 utils/profile.py  --args ./modern cpu --batch 1000

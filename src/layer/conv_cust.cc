@@ -1,9 +1,58 @@
 #include "conv_cust.h"
 #include <math.h>
 #include <iostream>
+#include <algorithm>
 
 bool Conv_Custom::verbose = true;
-bool Conv_Custom::use_direct = false;
+ConvMethod Conv_Custom::method = ConvMethod::GEMM;
+bool Conv_Custom::record_timing = false;
+std::vector<Conv_Custom*> Conv_Custom::instances;
+
+const char* Conv_Custom::method_name() {
+  switch (method) {
+    case ConvMethod::DIRECT_NAIVE:  return "direct kernel (naive)";
+    case ConvMethod::DIRECT_TILED:  return "direct kernel (tiled)";
+    case ConvMethod::DIRECT_COARSE: return "direct kernel (coarse, output-channel reg-tiled)";
+    default:                        return "im2col + cuBLAS GEMM";
+  }
+}
+
+// Banner emitted before per-layer timing lines; the profiler keys off "Conv-CUDA".
+static const char* method_banner() {
+  switch (Conv_Custom::method) {
+    case ConvMethod::DIRECT_NAIVE:  return "Conv-CUDA(direct-naive)==";
+    case ConvMethod::DIRECT_TILED:  return "Conv-CUDA(direct-tiled)==";
+    case ConvMethod::DIRECT_COARSE: return "Conv-CUDA(direct-coarse)==";
+    default:                        return "Conv-CUDA(im2col+gemm)==";
+  }
+}
+
+// Median of a copy of the samples (robust to the occasional OS/scheduler hiccup
+// in a way the mean is not).
+static float median_of(std::vector<float> v) {
+  if (v.empty()) return 0.0f;
+  std::sort(v.begin(), v.end());
+  size_t n = v.size();
+  return (n & 1) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+}
+
+void Conv_Custom::reset_timing() {
+  for (Conv_Custom* c : instances) {
+    c->op_ms.clear();
+    c->layer_ms.clear();
+  }
+}
+
+void Conv_Custom::report_timing() {
+  // Emit one banner + "Layer Time" + "Op Time" line per conv layer, carrying the
+  // median across all timed iterations. The format matches the per-call prints so
+  // utils/profile.py scrapes it unchanged.
+  for (Conv_Custom* c : instances) {
+    std::cout << method_banner() << std::endl;
+    std::cout << "Layer Time: " << median_of(c->layer_ms) << " ms" << std::endl;
+    std::cout << "Op Time: " << median_of(c->op_ms) << " ms" << std::endl;
+  }
+}
 
 void Conv_Custom::init()
 {
@@ -22,6 +71,9 @@ void Conv_Custom::init()
 
   // Initialize CUDA interface
   cudaInterface.setup();
+
+  // Register in construction order for the median-per-layer timing summary.
+  instances.push_back(this);
 }
 
 void Conv_Custom::forward(const Matrix &bottom)
@@ -43,27 +95,48 @@ void Conv_Custom::forward(const Matrix &bottom)
   float *y_d;
   float *k_d;
 
+  const bool use_gemm = (method == ConvMethod::GEMM);
+
   if (verbose)
-    std::cout << (use_direct ? "Conv-CUDA(direct)==" : "Conv-CUDA(im2col+gemm)==")
-              << std::endl;
+    std::cout << method_banner() << std::endl;
 
   // Start layer timer
   auto start_time_layer = std::chrono::high_resolution_clock::now();
-  // Data transfer CPU to GPU. The direct path doesn't need the unrolled buffer,
-  // so pass a null out-pointer to skip its (large) allocation.
+  // Data transfer CPU to GPU. Only the GEMM path needs the unrolled buffer, so
+  // the direct paths pass a null out-pointer to skip its (large) allocation.
   cudaInterface.conv_forward_cuda_prolog(y, x, k, &y_d, &x_d, &k_d,
-                                         use_direct ? nullptr : &x_unroll_d,
+                                         use_gemm ? &x_unroll_d : nullptr,
                                          B, M, C, height_in, width_in, K);
 
-  // Start kernel timer
-  auto start_time_kernel = std::chrono::high_resolution_clock::now();
-  // Hand off to GPU for computation: either a direct conv kernel or im2col+GEMM.
-  if (use_direct)
-    cudaInterface.conv_forward_cuda_direct(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
-  else
-    cudaInterface.conv_forward_cuda(y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
-  // Stop kernel timer
-  auto end_time_kernel = std::chrono::high_resolution_clock::now();
+  // Time only the GPU compute with CUDA events. Events measure GPU time directly,
+  // excluding the host-side launch overhead std::chrono would fold in. Sync first
+  // so the prolog's H2D copy isn't attributed to the op.
+  cudaEvent_t op_start, op_stop;
+  cudaEventCreate(&op_start);
+  cudaEventCreate(&op_stop);
+  cudaDeviceSynchronize();
+  cudaEventRecord(op_start);
+  // Hand off to GPU for computation: one of the three implementations.
+  switch (method) {
+    case ConvMethod::DIRECT_NAIVE:
+      cudaInterface.conv_forward_cuda_direct_naive(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      break;
+    case ConvMethod::DIRECT_TILED:
+      cudaInterface.conv_forward_cuda_direct_tiled(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      break;
+    case ConvMethod::DIRECT_COARSE:
+      cudaInterface.conv_forward_cuda_direct_coarse(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      break;
+    default:  // ConvMethod::GEMM
+      cudaInterface.conv_forward_cuda(y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
+      break;
+  }
+  cudaEventRecord(op_stop);
+  cudaEventSynchronize(op_stop);
+  float duration_kernel = 0.0f;  // ms
+  cudaEventElapsedTime(&duration_kernel, op_start, op_stop);
+  cudaEventDestroy(op_start);
+  cudaEventDestroy(op_stop);
 
   // Data transfer GPU to CPU
   cudaInterface.conv_forward_cuda_epilog(y, y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
@@ -72,10 +145,13 @@ void Conv_Custom::forward(const Matrix &bottom)
   auto end_time_layer = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<float, std::milli> duration_layer = (end_time_layer - start_time_layer);
-  std::chrono::duration<float, std::milli> duration_kernel = (end_time_kernel - start_time_kernel);
+  if (record_timing) {
+    op_ms.push_back(duration_kernel);
+    layer_ms.push_back(duration_layer.count());
+  }
   if (verbose) {
     std::cout << "Layer Time: " << duration_layer.count() << " ms" << std::endl;
-    std::cout << "Op Time: " << duration_kernel.count() << " ms" << std::endl;
+    std::cout << "Op Time: " << duration_kernel << " ms" << std::endl;
   }
 }
 
