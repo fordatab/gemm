@@ -8,7 +8,7 @@ LDFLAGS  := -lm -lgomp
 # CUDA paths and libraries
 CUDA_PATH ?= /usr/local/cuda
 CUDA_INC  = -I"$(CUDA_PATH)/include"
-CUDA_LIB  = -L"$(CUDA_PATH)/lib64" -lcudart -lcublas
+CUDA_LIB  = -L"$(CUDA_PATH)/lib64" -lcudart -lcublas -lcudnn
 
 
 LDFLAGS += $(CUDA_LIB)
@@ -67,23 +67,31 @@ clean:
 
 # CPU inference (Conv baseline)
 cpu:		modern
-		./modern cpu --batch 1000
+		./modern cpu --batch 2000
 
 # Custom GPU inference, im2col + cuBLAS GEMM (Conv_Custom)
 gpu:		modern
-		./modern cuda --batch 1000
+		./modern cuda --batch 2000
 
 # Custom GPU inference, direct convolution kernel — naive (Conv_Custom)
 gpu_naive:	modern
-		./modern naive --batch 1000
+		./modern naive --batch 2000
 
 # Custom GPU inference, direct convolution kernel — shared-mem tiled (Conv_Custom)
 gpu_tiled:	modern
-		./modern tiled --batch 1000
+		./modern tiled --batch 2000
 
 # Custom GPU inference, direct convolution kernel — output-channel reg-tiled (Conv_Custom)
 gpu_coarse:	modern
-		./modern coarse --batch 1000
+		./modern coarse --batch 2000
+
+# Custom GPU inference, direct convolution kernel — specialized for K=3 (Conv_Custom)
+gpu_spec:	modern
+		./modern spec --batch 2000
+
+# Hybrid: custom conv1 kernel + cuDNN for the deeper layers (Conv_Custom)
+gpu_hybrid:	modern
+		./modern hybrid --batch 2000
 
 modern_train:	modern
 		./modern train --epochs 10 --batch 128
@@ -94,17 +102,26 @@ modern_cuda:	gpu
 
 time: time_gpu
 
+# LOCK THE CLOCKS TO 1500 MHZ BEFORE TESTING
+# nvidia-smi -lgc 1500
+# nvidia-smi -rgc
 time_gpu:	modern
-		python3 utils/profile.py  --args ./modern cuda --batch 1000 --iters 20
+		python3 utils/profile.py  --args ./modern cuda --batch 2000 --iters 20
 
 time_gpu_naive:	modern
-		python3 utils/profile.py  --args ./modern naive --batch 1000 --iters 20
+		python3 utils/profile.py  --args ./modern naive --batch 2000 --iters 20
 
 time_gpu_tiled:	modern
-		python3 utils/profile.py  --args ./modern tiled --batch 1000 --iters 20
+		python3 utils/profile.py  --args ./modern tiled --batch 2000 --iters 20
 
 time_gpu_coarse:	modern
-		python3 utils/profile.py  --args ./modern coarse --batch 1000 --iters 20
+		python3 utils/profile.py  --args ./modern coarse --batch 2000 --iters 20
+
+time_gpu_spec:	modern
+		python3 utils/profile.py  --args ./modern spec --batch 2000 --iters 20
+
+time_gpu_hybrid:	modern
+		python3 utils/profile.py  --args ./modern hybrid --batch 2000 --iters 20
 
 time_cpu:	modern
-		python3 utils/profile.py  --args ./modern cpu --batch 1000
+		python3 utils/profile.py  --args ./modern cpu --batch 2000

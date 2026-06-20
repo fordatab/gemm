@@ -179,6 +179,8 @@ void print_usage(const char* prog) {
     std::cout << "  naive    Run inference on GPU (direct conv kernel, naive)" << std::endl;
     std::cout << "  tiled    Run inference on GPU (direct conv kernel, shared-mem tiled)" << std::endl;
     std::cout << "  coarse   Run inference on GPU (direct conv kernel, output-channel reg-tiled)" << std::endl;
+    std::cout << "  spec     Run inference on GPU (direct conv kernel, specialized for K=3)" << std::endl;
+    std::cout << "  hybrid   Run inference on GPU (custom conv1 kernel + cuDNN for deeper layers)" << std::endl;
     std::cout << std::endl;
     std::cout << "Options for train mode:" << std::endl;
     std::cout << "  --epochs N       Number of epochs (default: 10)" << std::endl;
@@ -255,6 +257,16 @@ int main(int argc, char* argv[]) {
         std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct kernel, coarse reg-tiled) ===" << std::endl;
         std::cout << "Test batch size: " << test_batch << std::endl;
         Conv_Custom::method = ConvMethod::DIRECT_COARSE;
+        inference_cuda(test_batch, iters);
+    } else if (mode == "spec") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: direct kernel, specialized K=3) ===" << std::endl;
+        std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::method = ConvMethod::DIRECT_SPEC;
+        inference_cuda(test_batch, iters);
+    } else if (mode == "hybrid") {
+        std::cout << "=== Modern VGG-style CNN Inference (CUDA: hybrid custom conv1 + cuDNN) ===" << std::endl;
+        std::cout << "Test batch size: " << test_batch << std::endl;
+        Conv_Custom::method = ConvMethod::HYBRID;
         inference_cuda(test_batch, iters);
     } else {
         std::cerr << "Unknown mode: " << mode << std::endl;

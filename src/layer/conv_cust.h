@@ -11,7 +11,9 @@ enum class ConvMethod {
   GEMM,          // im2col + cuBLAS GEMM (default)
   DIRECT_NAIVE,  // direct conv kernel, global memory only
   DIRECT_TILED,  // direct conv kernel, shared-memory halo tiling
-  DIRECT_COARSE  // direct conv kernel, shared input tile + output-channel reg tiling
+  DIRECT_COARSE, // direct conv kernel, shared input tile + output-channel reg tiling
+  DIRECT_SPEC,   // DIRECT_COARSE specialized for compile-time K=3 (fully unrolled)
+  HYBRID         // custom conv1 (C=1) kernel + cuDNN for the deeper layers
 };
 
 class Conv_Custom: public Layer {

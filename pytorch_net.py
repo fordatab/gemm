@@ -131,6 +131,19 @@ def profile(args):
                          "is False (you likely have the +cpu build of torch installed).")
     print(f"Device: {device}", flush=True)
 
+    # Precision parity: cudnn.allow_tf32 defaults to True, so cuDNN runs convs on
+    # TF32 tensor cores -- not comparable to an FP32 custom kernel. Force FP32 by
+    # default for a fair FP32-vs-FP32 race; pass --tf32 to allow tensor cores.
+    torch.backends.cudnn.allow_tf32 = args.tf32
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    # cuDNN heuristics can mis-pick an algorithm for some shapes; benchmark mode
+    # autotunes per shape (the strongest, fairest cuDNN baseline for fixed-shape
+    # inference). The first-call autotune cost is absorbed by the warmup iters.
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    print(f"TF32: {'on (tensor cores)' if args.tf32 else 'off (FP32 parity)'} | "
+          f"cudnn.benchmark: {'on (autotuned)' if args.cudnn_benchmark else 'off (heuristic)'}",
+          flush=True)
+
     model = ModernNet().to(device).eval()
     if args.weights:
         model.load_state_dict(torch.load(args.weights, map_location=device))
@@ -238,6 +251,12 @@ def main():
                         "default: cuda if available else cpu")
     p.add_argument("--weights", type=str, default=None,
                    help="optional state_dict to load before --profile")
+    p.add_argument("--tf32", action="store_true",
+                   help="allow cuDNN/matmul TF32 tensor cores in --profile (default: "
+                        "off, forcing FP32 for a fair comparison vs an FP32 custom kernel)")
+    p.add_argument("--cudnn-benchmark", action="store_true",
+                   help="enable cuDNN autotuning (per-shape best algorithm) in --profile "
+                        "-- the strongest, fairest cuDNN baseline for fixed-shape inference")
     args = p.parse_args()
 
     if args.profile:

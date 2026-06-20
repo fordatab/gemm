@@ -27,6 +27,16 @@
         }                                                                   \
     } while (0)
 
+#define CHECK_CUDNN(call)                                                   \
+    do {                                                                    \
+        cudnnStatus_t status_ = call;                                       \
+        if (status_ != CUDNN_STATUS_SUCCESS) {                              \
+            fprintf(stderr, "cuDNN error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudnnGetErrorString(status_));                          \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
 // CUDA kernel for im2col transformation
 __global__ void im2col_kernel(float *unrolled, const float *x,
                                const int B, const int C_in,
@@ -444,6 +454,201 @@ void CUDAInterface::conv_forward_cuda_direct_coarse(
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
+// --- Variant 4: specialized direct (compile-time K, output-channel reg tiling) --
+// Identical scheme to DIRECT_COARSE, but the kernel size K is a compile-time
+// template parameter instead of a runtime argument. That lets the compiler:
+//   * fully unroll the K*K accumulation into straight-line FMAs (no loop, no
+//     per-iteration index arithmetic),
+//   * size the halo tile (TILE_WIDTH+K-1)^2 and the K*K filter as fixed static
+//     shared arrays (no dynamic shared-memory launch parameter), and
+//   * constant-fold every (...*K*K) stride.
+// The input-channel loop still carries a __syncthreads (it stages one shared tile
+// per channel) so it stays rolled -- which is also why templating on C buys
+// little here; the win is the unrolled inner K*K and the fixed shared geometry.
+// Result is bit-identical to the other paths (valid conv, stride 1, no bias).
+template <int K>
+__global__ void conv_forward_direct_spec_kernel(float *y, const float *x,
+                                                const float *k,
+                                                const int B, const int M,
+                                                const int C, const int H,
+                                                const int W) {
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
+    constexpr int X_tile_width = TILE_WIDTH + K - 1;
+
+    // Fixed-size static shared memory (sizes known from the compile-time K).
+    __shared__ float tile_in[X_tile_width * X_tile_width];
+    __shared__ float tile_w[COARSE_TM * K * K];
+
+    const int b = blockIdx.z;
+    const int m_base = blockIdx.y * COARSE_TM;
+    const int h0 = (blockIdx.x / W_grid) * TILE_WIDTH;
+    const int w0 = (blockIdx.x % W_grid) * TILE_WIDTH;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int h = h0 + ty;
+    const int w = w0 + tx;
+
+    float acc[COARSE_TM];
+    #pragma unroll
+    for (int t = 0; t < COARSE_TM; ++t) acc[t] = 0.0f;
+
+    for (int c = 0; c < C; ++c) {
+        // Stage COARSE_TM filters (channel c). Out-of-range channels zero-filled.
+        for (int idx = ty * TILE_WIDTH + tx; idx < COARSE_TM * K * K;
+             idx += TILE_WIDTH * TILE_WIDTH) {
+            int t = idx / (K * K);
+            int off = idx % (K * K);
+            int m = m_base + t;
+            tile_w[idx] = (m < M) ? K2(m, c * K * K + off) : 0.0f;
+        }
+        // Stage the input halo tile for (b, c).
+        for (int i = ty; i < X_tile_width; i += TILE_WIDTH) {
+            for (int j = tx; j < X_tile_width; j += TILE_WIDTH) {
+                int in_r = h0 + i;
+                int in_c = w0 + j;
+                float val = 0.0f;
+                if (in_r < H && in_c < W)
+                    val = X4(b, c, in_r, in_c);
+                tile_in[i * X_tile_width + j] = val;
+            }
+        }
+        __syncthreads();
+
+        // Fully unrolled K*K accumulation, reusing each input across COARSE_TM
+        // output channels held in registers.
+        if (h < H_out && w < W_out) {
+            #pragma unroll
+            for (int kh = 0; kh < K; ++kh) {
+                #pragma unroll
+                for (int kw = 0; kw < K; ++kw) {
+                    float xv = tile_in[(ty + kh) * X_tile_width + (tx + kw)];
+                    #pragma unroll
+                    for (int t = 0; t < COARSE_TM; ++t)
+                        acc[t] += xv * tile_w[t * K * K + kh * K + kw];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (h < H_out && w < W_out) {
+        #pragma unroll
+        for (int t = 0; t < COARSE_TM; ++t) {
+            int m = m_base + t;
+            if (m < M) Y4(b, m, h, w) = acc[t];
+        }
+    }
+}
+
+// --- conv1 specialist: C=1, K=3, runtime M (the network's first layer) ----------
+// The first conv has a single input channel, so there is no cross-channel
+// accumulation to exploit and the generic kernels waste their per-channel
+// shared-staging + barrier here. Instead ONE block computes a C1_TILE x C1_TILE
+// output tile for ALL M output channels of one image: it stages the single-channel
+// input halo tile and the M*9 filters into shared once (one barrier), then each
+// thread loads its 3x3 input window into registers and produces all M outputs,
+// reusing those 9 register values across every output channel. With no channel-
+// group grid dimension the input tile is read from global exactly once (the spec
+// kernel re-read it once per COARSE_TM-channel group). K=3 is hard-unrolled.
+#define C1_TILE TILE_WIDTH
+__global__ void conv_forward_c1_kernel(float *y, const float *__restrict__ x,
+                                       const float *__restrict__ k,
+                                       const int B, const int M,
+                                       const int H, const int W) {
+    constexpr int K = 3;
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int W_grid = (W_out + C1_TILE - 1) / C1_TILE;
+    constexpr int X_tile = C1_TILE + K - 1;
+
+    extern __shared__ float smem[];
+    float *tile_in = smem;                     // X_tile*X_tile floats (input halo)
+    float *tile_w  = smem + X_tile * X_tile;   // M*9 floats (all filters)
+
+    const int b  = blockIdx.z;
+    const int h0 = (blockIdx.x / W_grid) * C1_TILE;
+    const int w0 = (blockIdx.x % W_grid) * C1_TILE;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int h  = h0 + ty;
+    const int w  = w0 + tx;
+    const int tid = ty * C1_TILE + tx;
+    const int nthreads = C1_TILE * C1_TILE;
+
+    // Stage all M filters (M*9 floats; C=1 so weight m starts at k[m*9]).
+    for (int idx = tid; idx < M * 9; idx += nthreads)
+        tile_w[idx] = k[idx];
+    // Stage the single-channel input halo tile.
+    for (int i = ty; i < X_tile; i += C1_TILE)
+        for (int j = tx; j < X_tile; j += C1_TILE) {
+            int in_r = h0 + i, in_c = w0 + j;
+            tile_in[i * X_tile + j] =
+                (in_r < H && in_c < W) ? x[(size_t)b * (H * W) + in_r * W + in_c] : 0.0f;
+        }
+    __syncthreads();
+
+    if (h < H_out && w < W_out) {
+        // This thread's 3x3 window, held in registers and reused across all M.
+        const float r00 = tile_in[(ty+0)*X_tile + (tx+0)];
+        const float r01 = tile_in[(ty+0)*X_tile + (tx+1)];
+        const float r02 = tile_in[(ty+0)*X_tile + (tx+2)];
+        const float r10 = tile_in[(ty+1)*X_tile + (tx+0)];
+        const float r11 = tile_in[(ty+1)*X_tile + (tx+1)];
+        const float r12 = tile_in[(ty+1)*X_tile + (tx+2)];
+        const float r20 = tile_in[(ty+2)*X_tile + (tx+0)];
+        const float r21 = tile_in[(ty+2)*X_tile + (tx+1)];
+        const float r22 = tile_in[(ty+2)*X_tile + (tx+2)];
+        const size_t ybase = (size_t)b * (M * H_out * W_out) + (size_t)h * W_out + w;
+        const size_t mstride = (size_t)H_out * W_out;
+        for (int m = 0; m < M; ++m) {
+            const float *wm = &tile_w[m * 9];
+            float acc = r00*wm[0] + r01*wm[1] + r02*wm[2]
+                      + r10*wm[3] + r11*wm[4] + r12*wm[5]
+                      + r20*wm[6] + r21*wm[7] + r22*wm[8];
+            y[ybase + (size_t)m * mstride] = acc;
+        }
+    }
+}
+
+void CUDAInterface::conv_forward_cuda_direct_spec(
+    float *device_y, const float *device_x, const float *device_k,
+    const int B, const int M, const int C, const int H, const int W, const int K)
+{
+    int H_out = H - K + 1;
+    int W_out = W - K + 1;
+    int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
+    int H_grid = (H_out + TILE_WIDTH - 1) / TILE_WIDTH;
+    int M_groups = (M + COARSE_TM - 1) / COARSE_TM;
+
+    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+    dim3 gridDim(W_grid * H_grid, M_groups, B);
+
+    // Specialized dispatch for this network's 3x3 convs: the first layer (C=1)
+    // gets a dedicated kernel; the rest use the compile-time-K reg-tiled kernel;
+    // any other K falls back to the runtime-K coarse kernel.
+    if (K == 3 && C == 1) {
+        constexpr int X_tile = TILE_WIDTH + 3 - 1;
+        size_t shmem_bytes =
+            (static_cast<size_t>(X_tile) * X_tile + static_cast<size_t>(M) * 9) * sizeof(float);
+        dim3 c1_grid(W_grid * H_grid, 1, B);
+        conv_forward_c1_kernel<<<c1_grid, blockDim, shmem_bytes>>>(
+            device_y, device_x, device_k, B, M, H, W);
+    } else if (K == 3) {
+        conv_forward_direct_spec_kernel<3><<<gridDim, blockDim>>>(
+            device_y, device_x, device_k, B, M, C, H, W);
+    } else {
+        int X_tile_width = TILE_WIDTH + K - 1;
+        size_t shmem_bytes =
+            (static_cast<size_t>(X_tile_width) * X_tile_width + COARSE_TM * K * K) * sizeof(float);
+        conv_forward_direct_coarse_kernel<<<gridDim, blockDim, shmem_bytes>>>(
+            device_y, device_x, device_k, B, M, C, H, W, K);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+}
+
 #undef X4
 #undef K2
 #undef Y4
@@ -464,4 +669,97 @@ void CUDAInterface::conv_forward_cuda_epilog(
     CHECK_CUDA(cudaFree(device_k));
     CHECK_CUDA(cudaFree(device_y));
     CHECK_CUDA(cudaFree(device_x_unroll));
+}
+
+// cuDNN convolution forward. Used by the HYBRID method for the deeper layers
+// (cuDNN's autotuned Winograd/implicit-GEMM beats the custom direct kernels
+// there). Descriptors + the autotuned algorithm + workspace are built once per
+// batch size and cached on the CUDAInterface, so on steady-state forwards only
+// cudnnConvolutionForward runs inside the caller's timed region -- the same way
+// PyTorch's benchmark mode amortizes its one-time algo selection.
+void CUDAInterface::conv_forward_cudnn(
+    float *device_y, const float *device_x, const float *device_k,
+    const int B, const int M, const int C, const int H, const int W, const int K)
+{
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+
+    if (!cudnnDescInit) {
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&xDesc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&yDesc));
+        CHECK_CUDNN(cudnnCreateFilterDescriptor(&wDesc));
+        CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&convDesc));
+        cudnnDescInit = true;
+    }
+
+    // (Re)build descriptors + autotune the algorithm only when B changes; M, C,
+    // H, W, K are fixed for the conv layer owning this CUDAInterface.
+    if (cudnnCachedB != B) {
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(xDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_FLOAT, B, C, H, W));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_FLOAT, B, M, H_out, W_out));
+        CHECK_CUDNN(cudnnSetFilter4dDescriptor(wDesc, CUDNN_DATA_FLOAT,
+            CUDNN_TENSOR_NCHW, M, C, K, K));
+        // CROSS_CORRELATION (no kernel flip) matches the custom kernels / im2col
+        // and the trained weights.
+        CHECK_CUDNN(cudnnSetConvolution2dDescriptor(convDesc, 0, 0, 1, 1, 1, 1,
+            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+
+        // Autotune with REAL tensors + a real workspace budget -- this is
+        // cudnnFindConvolutionForwardAlgorithmEx, the exact routine PyTorch's
+        // cudnn.benchmark=True uses. The non-Ex Find (internal dummy buffers)
+        // mis-measured and picked materially worse algorithms on the deeper
+        // layers. Runs once, in the caller's untimed warmup forward; it scribbles
+        // over device_y, which is fine (warmup output is discarded).
+        const size_t findWsBytes = 256ull * 1024 * 1024;  // 256 MB autotune budget
+        void *findWs = nullptr;
+        CHECK_CUDA(cudaMalloc(&findWs, findWsBytes));
+        int returned = 0;
+        cudnnConvolutionFwdAlgoPerf_t perf[8];
+        CHECK_CUDNN(cudnnFindConvolutionForwardAlgorithmEx(cudnnHandle,
+            xDesc, device_x, wDesc, device_k, convDesc, yDesc, device_y,
+            8, &returned, perf, findWs, findWsBytes));
+        CHECK_CUDA(cudaFree(findWs));
+        // Pick the fastest *successful, non-tensor-core* result so the chosen algo
+        // runs in true FP32 (parity with the allow_tf32=False PyTorch baseline);
+        // perf[] is sorted fastest-first. Crucially, set convDesc's math type to
+        // match the chosen algo -- an algo/mathType mismatch is exactly what makes
+        // cudnnConvolutionForward return CUDNN_STATUS_BAD_PARAM.
+        bool picked = false;
+        for (int i = 0; i < returned && !picked; ++i) {
+            if (perf[i].status != CUDNN_STATUS_SUCCESS) continue;
+            if (perf[i].mathType == CUDNN_TENSOR_OP_MATH ||
+                perf[i].mathType == CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION) continue;
+            cudnnAlgo = perf[i].algo;
+            CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, perf[i].mathType));
+            picked = true;
+        }
+        for (int i = 0; i < returned && !picked; ++i) {  // fallback: any success
+            if (perf[i].status != CUDNN_STATUS_SUCCESS) continue;
+            cudnnAlgo = perf[i].algo;
+            CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, perf[i].mathType));
+            picked = true;
+        }
+        if (!picked) {
+            fprintf(stderr, "cuDNN: no usable forward algorithm found\n");
+            exit(EXIT_FAILURE);
+        }
+
+        size_t wsBytes = 0;
+        CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle,
+            xDesc, wDesc, convDesc, yDesc, cudnnAlgo, &wsBytes));
+        if (wsBytes > cudnnWorkspaceBytes) {
+            if (cudnnWorkspace) CHECK_CUDA(cudaFree(cudnnWorkspace));
+            CHECK_CUDA(cudaMalloc(&cudnnWorkspace, wsBytes));
+            cudnnWorkspaceBytes = wsBytes;
+        }
+        cudnnCachedB = B;
+    }
+
+    const float alpha = 1.0f, beta = 0.0f;
+    CHECK_CUDNN(cudnnConvolutionForward(cudnnHandle, &alpha,
+        xDesc, device_x, wDesc, device_k, convDesc, cudnnAlgo,
+        cudnnWorkspace, cudnnWorkspaceBytes, &beta, yDesc, device_y));
+    CHECK_CUDA(cudaDeviceSynchronize());
 }

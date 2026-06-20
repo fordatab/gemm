@@ -13,6 +13,8 @@ const char* Conv_Custom::method_name() {
     case ConvMethod::DIRECT_NAIVE:  return "direct kernel (naive)";
     case ConvMethod::DIRECT_TILED:  return "direct kernel (tiled)";
     case ConvMethod::DIRECT_COARSE: return "direct kernel (coarse, output-channel reg-tiled)";
+    case ConvMethod::DIRECT_SPEC:   return "direct kernel (specialized K=3, reg-tiled)";
+    case ConvMethod::HYBRID:        return "hybrid (custom conv1 + cuDNN deeper layers)";
     default:                        return "im2col + cuBLAS GEMM";
   }
 }
@@ -23,6 +25,8 @@ static const char* method_banner() {
     case ConvMethod::DIRECT_NAIVE:  return "Conv-CUDA(direct-naive)==";
     case ConvMethod::DIRECT_TILED:  return "Conv-CUDA(direct-tiled)==";
     case ConvMethod::DIRECT_COARSE: return "Conv-CUDA(direct-coarse)==";
+    case ConvMethod::DIRECT_SPEC:   return "Conv-CUDA(direct-spec)==";
+    case ConvMethod::HYBRID:        return "Conv-CUDA(hybrid)==";
     default:                        return "Conv-CUDA(im2col+gemm)==";
   }
 }
@@ -126,6 +130,17 @@ void Conv_Custom::forward(const Matrix &bottom)
       break;
     case ConvMethod::DIRECT_COARSE:
       cudaInterface.conv_forward_cuda_direct_coarse(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      break;
+    case ConvMethod::DIRECT_SPEC:
+      cudaInterface.conv_forward_cuda_direct_spec(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      break;
+    case ConvMethod::HYBRID:
+      // Per-layer best-of: the custom kernel wins the C=1 first layer; cuDNN wins
+      // the deeper layers, so route each to its faster implementation.
+      if (C == 1)
+        cudaInterface.conv_forward_cuda_direct_spec(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
+      else
+        cudaInterface.conv_forward_cudnn(y_d, x_d, k_d, B, M, C, height_in, width_in, K);
       break;
     default:  // ConvMethod::GEMM
       cudaInterface.conv_forward_cuda(y_d, x_d, k_d, x_unroll_d, B, M, C, height_in, width_in, K);
