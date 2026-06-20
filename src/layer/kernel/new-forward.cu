@@ -6,6 +6,7 @@
 #include <cublas_v2.h>
 
 #include "gpu-utils.cuh"
+#include "conv_kernels.cuh"
 
 #define CHECK_CUDA(call)                                                    \
     do {                                                                    \
@@ -36,43 +37,6 @@
             exit(EXIT_FAILURE);                                             \
         }                                                                   \
     } while (0)
-
-// CUDA kernel for im2col transformation
-__global__ void im2col_kernel(float *unrolled, const float *x,
-                               const int B, const int C_in,
-                               const int H, const int W, const int K) {
-    // Compute output and unrolled dimensions
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int H_unroll = C_in * K * K;
-    int W_unroll = H_out * W_out;
-
-    // Get global indices
-    int col_u = blockIdx.x * blockDim.x + threadIdx.x; // 0 to W_unroll - 1
-    int row_u = blockIdx.y * blockDim.y + threadIdx.y; // 0 to H_unroll - 1
-    int b = blockIdx.z;                                 // 0 to B - 1
-
-    // Bounds check
-    if (col_u >= W_unroll || row_u >= H_unroll || b >= B) return;
-
-    // Compute indices for unrolled matrix
-    int c_in = row_u / (K * K);
-    int mask_offset_row = (row_u % (K * K)) / K;
-    int mask_offset_col = row_u % K;
-    int row_o = col_u / W_out;
-    int col_o = col_u % W_out;
-
-    // Compute corresponding input position
-    int row_i = row_o + mask_offset_row;
-    int col_i = col_o + mask_offset_col;
-
-    // Compute flattened indices for memory access
-    size_t unrolled_idx = (size_t)b * (H_unroll * W_unroll) + row_u * W_unroll + col_u;
-    size_t x_idx = (size_t)b * (C_in * H * W) + c_in * (H * W) + row_i * W + col_i;
-
-    // Assign value from input to unrolled tensor
-    unrolled[unrolled_idx] = x[x_idx];
-}
 
 void CUDAInterface::conv_forward_cuda_prolog(
     const float *host_y, const float *host_x, const float *host_k,
@@ -173,61 +137,6 @@ void CUDAInterface::conv_forward_cuda(
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-// ===========================================================================
-// Direct convolution kernels (no im2col, no GEMM). Two variants share the same
-// output-tiling scheme and produce output bit-identical to the im2col + GEMM
-// path, so all three implementations are interchangeable:
-//
-//   x : (B, C, H, W)               row-major
-//   k : (M, C*K*K)                 weight[m * (C*K*K) + (c*K*K + kh*K + kw)]
-//   y : (B, M, H_out, W_out)       row-major
-//   Semantics: valid conv (H_out = H-K+1), stride 1, no padding, no bias.
-//
-// Each block owns a TILE_WIDTH x TILE_WIDTH output tile for a fixed
-// (batch, out-channel); the grid is (W_grid*H_grid, M, B). Within the kernel:
-//   b = blockIdx.z, m = blockIdx.y
-//   h = (blockIdx.x / W_grid)*TILE_WIDTH + threadIdx.y
-//   w = (blockIdx.x % W_grid)*TILE_WIDTH + threadIdx.x
-// ===========================================================================
-#define TILE_WIDTH 16
-
-// Flattened-index helpers for the row-major tensors, shared by both kernels.
-#define X4(bb, cc, hh, ww) x[(size_t)(bb) * (C * H * W) + (cc) * (H * W) + (hh) * W + (ww)]
-#define K2(mm, off)        k[(size_t)(mm) * (C * K * K) + (off)]
-#define Y4(bb, mm, hh, ww) y[(size_t)(bb) * (M * H_out * W_out) + (mm) * (H_out * W_out) + (hh) * W_out + (ww)]
-
-// --- Variant 1: naive direct -----------------------------------------------
-// One thread computes one output element, reading input and weights straight
-// from global memory (relying on L1/L2 for the overlapping-window reuse). No
-// shared memory, no barriers.
-__global__ void conv_forward_direct_naive_kernel(float *y, const float *x,
-                                                 const float *k,
-                                                 const int B, const int M,
-                                                 const int C, const int H,
-                                                 const int W, const int K) {
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    const int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
-
-    int b = blockIdx.z;                                   // batch index
-    int m = blockIdx.y;                                   // output channel
-    int h = (blockIdx.x / W_grid) * TILE_WIDTH + threadIdx.y; // output row
-    int w = (blockIdx.x % W_grid) * TILE_WIDTH + threadIdx.x; // output col
-
-    if (b >= B || m >= M || h >= H_out || w >= W_out) return;
-
-    float acc = 0.0f;
-    for (int c = 0; c < C; ++c) {
-        int koff = c * K * K;
-        for (int kh = 0; kh < K; ++kh) {
-            for (int kw = 0; kw < K; ++kw) {
-                acc += X4(b, c, h + kh, w + kw) * K2(m, koff + kh * K + kw);
-            }
-        }
-    }
-    Y4(b, m, h, w) = acc;
-}
-
 void CUDAInterface::conv_forward_cuda_direct_naive(
     float *device_y, const float *device_x, const float *device_k,
     const int B, const int M, const int C, const int H, const int W, const int K)
@@ -244,74 +153,6 @@ void CUDAInterface::conv_forward_cuda_direct_naive(
         device_y, device_x, device_k, B, M, C, H, W, K);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
-}
-
-// --- Variant 2: tiled direct (shared memory) -------------------------------
-// For each input channel the block cooperatively stages into shared memory the
-// (TILE_WIDTH + K - 1)^2 input "halo" tile (adjacent outputs overlap by K-1, so
-// this turns ~K*K redundant global loads per pixel into one reused shared-memory
-// load) plus the K*K filter for the current (m, c). Shared memory is sized at
-// launch: ((TILE_WIDTH + K - 1)^2 + K*K) * sizeof(float).
-__global__ void conv_forward_direct_tiled_kernel(float *y, const float *x,
-                                                 const float *k,
-                                                 const int B, const int M,
-                                                 const int C, const int H,
-                                                 const int W, const int K) {
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    const int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
-    const int X_tile_width = TILE_WIDTH + K - 1;
-
-    // Dynamic shared memory: input halo tile followed by the K*K filter.
-    extern __shared__ float smem[];
-    float *tile_in = smem;                              // X_tile_width^2 floats
-    float *tile_w  = smem + X_tile_width * X_tile_width; // K*K floats
-
-    const int b = blockIdx.z;                       // batch index
-    const int m = blockIdx.y;                       // output channel
-    const int h0 = (blockIdx.x / W_grid) * TILE_WIDTH; // tile origin row (output)
-    const int w0 = (blockIdx.x % W_grid) * TILE_WIDTH; // tile origin col (output)
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int h = h0 + ty;                          // output row for this thread
-    const int w = w0 + tx;                          // output col for this thread
-
-    float acc = 0.0f;
-    for (int c = 0; c < C; ++c) {
-        // Stage this channel's filter (K*K) into shared memory.
-        for (int idx = ty * TILE_WIDTH + tx; idx < K * K;
-             idx += TILE_WIDTH * TILE_WIDTH) {
-            tile_w[idx] = K2(m, c * K * K + idx);
-        }
-        // Stage the input halo tile (X_tile_width^2) into shared memory.
-        // Out-of-range cells are zero-filled; they are only ever read by
-        // out-of-range output threads, which never write a result.
-        for (int i = ty; i < X_tile_width; i += TILE_WIDTH) {
-            for (int j = tx; j < X_tile_width; j += TILE_WIDTH) {
-                int in_r = h0 + i;
-                int in_c = w0 + j;
-                float val = 0.0f;
-                if (in_r < H && in_c < W)
-                    val = X4(b, c, in_r, in_c);
-                tile_in[i * X_tile_width + j] = val;
-            }
-        }
-        __syncthreads();
-
-        // Accumulate this channel's contribution from shared memory.
-        if (h < H_out && w < W_out) {
-            for (int kh = 0; kh < K; ++kh) {
-                for (int kw = 0; kw < K; ++kw) {
-                    acc += tile_in[(ty + kh) * X_tile_width + (tx + kw)] *
-                           tile_w[kh * K + kw];
-                }
-            }
-        }
-        __syncthreads();  // protect shared buffers before the next channel reuses them
-    }
-
-    if (h < H_out && w < W_out)
-        Y4(b, m, h, w) = acc;
 }
 
 void CUDAInterface::conv_forward_cuda_direct_tiled(
@@ -336,101 +177,6 @@ void CUDAInterface::conv_forward_cuda_direct_tiled(
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-// --- Variant 3: coarse direct (shared input tile + output-channel reg tiling) ---
-// The tiled kernel above computes ONE output channel per block, so the same input
-// tile is reloaded once per output channel (M passes over the input) and each
-// loaded input value feeds only K*K MACs -- it is memory-bound and loses to
-// im2col + cuBLAS. This variant fixes the reuse: each block owns a TILE_WIDTH x
-// TILE_WIDTH output tile for a GROUP of COARSE_TM output channels. The input halo
-// tile is staged into shared memory once per input channel and reused across all
-// COARSE_TM output channels, which are accumulated in per-thread registers. Each
-// loaded input value now feeds COARSE_TM*K*K MACs, raising arithmetic intensity
-// ~COARSE_TM-fold. This is essentially an implicit GEMM that gathers the conv
-// window directly, skipping im2col's global write+read.
-//
-//   grid  = (W_grid*H_grid, ceil(M / COARSE_TM), B)
-//   block = (TILE_WIDTH, TILE_WIDTH)
-//   each thread -> one output pixel for COARSE_TM output channels.
-// Output is bit-identical to the other paths (valid conv, stride 1, no bias).
-#define COARSE_TM 8
-
-__global__ void conv_forward_direct_coarse_kernel(float *y, const float *x,
-                                                  const float *k,
-                                                  const int B, const int M,
-                                                  const int C, const int H,
-                                                  const int W, const int K) {
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    const int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
-    const int X_tile_width = TILE_WIDTH + K - 1;
-
-    // Dynamic shared memory: input halo tile, then COARSE_TM filters (K*K each).
-    extern __shared__ float smem[];
-    float *tile_in = smem;                               // X_tile_width^2 floats
-    float *tile_w  = smem + X_tile_width * X_tile_width; // COARSE_TM*K*K floats
-
-    const int b = blockIdx.z;                        // batch index
-    const int m_base = blockIdx.y * COARSE_TM;       // first out-channel of group
-    const int h0 = (blockIdx.x / W_grid) * TILE_WIDTH; // tile origin row (output)
-    const int w0 = (blockIdx.x % W_grid) * TILE_WIDTH; // tile origin col (output)
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int h = h0 + ty;                           // output row for this thread
-    const int w = w0 + tx;                           // output col for this thread
-
-    // One register accumulator per output channel in the group.
-    float acc[COARSE_TM];
-    #pragma unroll
-    for (int t = 0; t < COARSE_TM; ++t) acc[t] = 0.0f;
-
-    for (int c = 0; c < C; ++c) {
-        // Stage COARSE_TM filters (channel c) into shared memory. Out-of-range
-        // channels (when M is not a multiple of COARSE_TM) are zero-filled; their
-        // accumulators are computed but never written.
-        for (int idx = ty * TILE_WIDTH + tx; idx < COARSE_TM * K * K;
-             idx += TILE_WIDTH * TILE_WIDTH) {
-            int t = idx / (K * K);
-            int off = idx % (K * K);
-            int m = m_base + t;
-            tile_w[idx] = (m < M) ? K2(m, c * K * K + off) : 0.0f;
-        }
-        // Stage the input halo tile (X_tile_width^2) for (b, c) into shared memory.
-        for (int i = ty; i < X_tile_width; i += TILE_WIDTH) {
-            for (int j = tx; j < X_tile_width; j += TILE_WIDTH) {
-                int in_r = h0 + i;
-                int in_c = w0 + j;
-                float val = 0.0f;
-                if (in_r < H && in_c < W)
-                    val = X4(b, c, in_r, in_c);
-                tile_in[i * X_tile_width + j] = val;
-            }
-        }
-        __syncthreads();
-
-        // Accumulate this channel's contribution, reusing each input value across
-        // all COARSE_TM output channels.
-        if (h < H_out && w < W_out) {
-            for (int kh = 0; kh < K; ++kh) {
-                for (int kw = 0; kw < K; ++kw) {
-                    float xv = tile_in[(ty + kh) * X_tile_width + (tx + kw)];
-                    #pragma unroll
-                    for (int t = 0; t < COARSE_TM; ++t)
-                        acc[t] += xv * tile_w[t * K * K + kh * K + kw];
-                }
-            }
-        }
-        __syncthreads();  // protect shared buffers before the next channel reuses them
-    }
-
-    if (h < H_out && w < W_out) {
-        #pragma unroll
-        for (int t = 0; t < COARSE_TM; ++t) {
-            int m = m_base + t;
-            if (m < M) Y4(b, m, h, w) = acc[t];
-        }
-    }
-}
-
 void CUDAInterface::conv_forward_cuda_direct_coarse(
     float *device_y, const float *device_x, const float *device_k,
     const int B, const int M, const int C, const int H, const int W, const int K)
@@ -452,164 +198,6 @@ void CUDAInterface::conv_forward_cuda_direct_coarse(
         device_y, device_x, device_k, B, M, C, H, W, K);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
-}
-
-// --- Variant 4: specialized direct (compile-time K, output-channel reg tiling) --
-// Identical scheme to DIRECT_COARSE, but the kernel size K is a compile-time
-// template parameter instead of a runtime argument. That lets the compiler:
-//   * fully unroll the K*K accumulation into straight-line FMAs (no loop, no
-//     per-iteration index arithmetic),
-//   * size the halo tile (TILE_WIDTH+K-1)^2 and the K*K filter as fixed static
-//     shared arrays (no dynamic shared-memory launch parameter), and
-//   * constant-fold every (...*K*K) stride.
-// The input-channel loop still carries a __syncthreads (it stages one shared tile
-// per channel) so it stays rolled -- which is also why templating on C buys
-// little here; the win is the unrolled inner K*K and the fixed shared geometry.
-// Result is bit-identical to the other paths (valid conv, stride 1, no bias).
-template <int K>
-__global__ void conv_forward_direct_spec_kernel(float *y, const float *x,
-                                                const float *k,
-                                                const int B, const int M,
-                                                const int C, const int H,
-                                                const int W) {
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    const int W_grid = (W_out + TILE_WIDTH - 1) / TILE_WIDTH;
-    constexpr int X_tile_width = TILE_WIDTH + K - 1;
-
-    // Fixed-size static shared memory (sizes known from the compile-time K).
-    __shared__ float tile_in[X_tile_width * X_tile_width];
-    __shared__ float tile_w[COARSE_TM * K * K];
-
-    const int b = blockIdx.z;
-    const int m_base = blockIdx.y * COARSE_TM;
-    const int h0 = (blockIdx.x / W_grid) * TILE_WIDTH;
-    const int w0 = (blockIdx.x % W_grid) * TILE_WIDTH;
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int h = h0 + ty;
-    const int w = w0 + tx;
-
-    float acc[COARSE_TM];
-    #pragma unroll
-    for (int t = 0; t < COARSE_TM; ++t) acc[t] = 0.0f;
-
-    for (int c = 0; c < C; ++c) {
-        // Stage COARSE_TM filters (channel c). Out-of-range channels zero-filled.
-        for (int idx = ty * TILE_WIDTH + tx; idx < COARSE_TM * K * K;
-             idx += TILE_WIDTH * TILE_WIDTH) {
-            int t = idx / (K * K);
-            int off = idx % (K * K);
-            int m = m_base + t;
-            tile_w[idx] = (m < M) ? K2(m, c * K * K + off) : 0.0f;
-        }
-        // Stage the input halo tile for (b, c).
-        for (int i = ty; i < X_tile_width; i += TILE_WIDTH) {
-            for (int j = tx; j < X_tile_width; j += TILE_WIDTH) {
-                int in_r = h0 + i;
-                int in_c = w0 + j;
-                float val = 0.0f;
-                if (in_r < H && in_c < W)
-                    val = X4(b, c, in_r, in_c);
-                tile_in[i * X_tile_width + j] = val;
-            }
-        }
-        __syncthreads();
-
-        // Fully unrolled K*K accumulation, reusing each input across COARSE_TM
-        // output channels held in registers.
-        if (h < H_out && w < W_out) {
-            #pragma unroll
-            for (int kh = 0; kh < K; ++kh) {
-                #pragma unroll
-                for (int kw = 0; kw < K; ++kw) {
-                    float xv = tile_in[(ty + kh) * X_tile_width + (tx + kw)];
-                    #pragma unroll
-                    for (int t = 0; t < COARSE_TM; ++t)
-                        acc[t] += xv * tile_w[t * K * K + kh * K + kw];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    if (h < H_out && w < W_out) {
-        #pragma unroll
-        for (int t = 0; t < COARSE_TM; ++t) {
-            int m = m_base + t;
-            if (m < M) Y4(b, m, h, w) = acc[t];
-        }
-    }
-}
-
-// --- conv1 specialist: C=1, K=3, runtime M (the network's first layer) ----------
-// The first conv has a single input channel, so there is no cross-channel
-// accumulation to exploit and the generic kernels waste their per-channel
-// shared-staging + barrier here. Instead ONE block computes a C1_TILE x C1_TILE
-// output tile for ALL M output channels of one image: it stages the single-channel
-// input halo tile and the M*9 filters into shared once (one barrier), then each
-// thread loads its 3x3 input window into registers and produces all M outputs,
-// reusing those 9 register values across every output channel. With no channel-
-// group grid dimension the input tile is read from global exactly once (the spec
-// kernel re-read it once per COARSE_TM-channel group). K=3 is hard-unrolled.
-#define C1_TILE TILE_WIDTH
-__global__ void conv_forward_c1_kernel(float *y, const float *__restrict__ x,
-                                       const float *__restrict__ k,
-                                       const int B, const int M,
-                                       const int H, const int W) {
-    constexpr int K = 3;
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    const int W_grid = (W_out + C1_TILE - 1) / C1_TILE;
-    constexpr int X_tile = C1_TILE + K - 1;
-
-    extern __shared__ float smem[];
-    float *tile_in = smem;                     // X_tile*X_tile floats (input halo)
-    float *tile_w  = smem + X_tile * X_tile;   // M*9 floats (all filters)
-
-    const int b  = blockIdx.z;
-    const int h0 = (blockIdx.x / W_grid) * C1_TILE;
-    const int w0 = (blockIdx.x % W_grid) * C1_TILE;
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int h  = h0 + ty;
-    const int w  = w0 + tx;
-    const int tid = ty * C1_TILE + tx;
-    const int nthreads = C1_TILE * C1_TILE;
-
-    // Stage all M filters (M*9 floats; C=1 so weight m starts at k[m*9]).
-    for (int idx = tid; idx < M * 9; idx += nthreads)
-        tile_w[idx] = k[idx];
-    // Stage the single-channel input halo tile.
-    for (int i = ty; i < X_tile; i += C1_TILE)
-        for (int j = tx; j < X_tile; j += C1_TILE) {
-            int in_r = h0 + i, in_c = w0 + j;
-            tile_in[i * X_tile + j] =
-                (in_r < H && in_c < W) ? x[(size_t)b * (H * W) + in_r * W + in_c] : 0.0f;
-        }
-    __syncthreads();
-
-    if (h < H_out && w < W_out) {
-        // This thread's 3x3 window, held in registers and reused across all M.
-        const float r00 = tile_in[(ty+0)*X_tile + (tx+0)];
-        const float r01 = tile_in[(ty+0)*X_tile + (tx+1)];
-        const float r02 = tile_in[(ty+0)*X_tile + (tx+2)];
-        const float r10 = tile_in[(ty+1)*X_tile + (tx+0)];
-        const float r11 = tile_in[(ty+1)*X_tile + (tx+1)];
-        const float r12 = tile_in[(ty+1)*X_tile + (tx+2)];
-        const float r20 = tile_in[(ty+2)*X_tile + (tx+0)];
-        const float r21 = tile_in[(ty+2)*X_tile + (tx+1)];
-        const float r22 = tile_in[(ty+2)*X_tile + (tx+2)];
-        const size_t ybase = (size_t)b * (M * H_out * W_out) + (size_t)h * W_out + w;
-        const size_t mstride = (size_t)H_out * W_out;
-        for (int m = 0; m < M; ++m) {
-            const float *wm = &tile_w[m * 9];
-            float acc = r00*wm[0] + r01*wm[1] + r02*wm[2]
-                      + r10*wm[3] + r11*wm[4] + r12*wm[5]
-                      + r20*wm[6] + r21*wm[7] + r22*wm[8];
-            y[ybase + (size_t)m * mstride] = acc;
-        }
-    }
 }
 
 void CUDAInterface::conv_forward_cuda_direct_spec(
@@ -636,7 +224,7 @@ void CUDAInterface::conv_forward_cuda_direct_spec(
         conv_forward_c1_kernel<<<c1_grid, blockDim, shmem_bytes>>>(
             device_y, device_x, device_k, B, M, H, W);
     } else if (K == 3) {
-        conv_forward_direct_spec_kernel<3><<<gridDim, blockDim>>>(
+        conv_forward_direct_spec_kernel<<<gridDim, blockDim>>>(
             device_y, device_x, device_k, B, M, C, H, W);
     } else {
         int X_tile_width = TILE_WIDTH + K - 1;
@@ -648,10 +236,6 @@ void CUDAInterface::conv_forward_cuda_direct_spec(
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 }
-
-#undef X4
-#undef K2
-#undef Y4
 
 void CUDAInterface::conv_forward_cuda_epilog(
     float *host_y, float *device_y, float *device_x, float *device_k, float *device_x_unroll,
@@ -727,7 +311,7 @@ void CUDAInterface::conv_forward_cudnn(
         // match the chosen algo -- an algo/mathType mismatch is exactly what makes
         // cudnnConvolutionForward return CUDNN_STATUS_BAD_PARAM.
         bool picked = false;
-        for (int i = 0; i < returned && !picked; ++i) {
+        for (int i = 0; i < returned && !picked; ++i) {  // fallback: any success
             if (perf[i].status != CUDNN_STATUS_SUCCESS) continue;
             if (perf[i].mathType == CUDNN_TENSOR_OP_MATH ||
                 perf[i].mathType == CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION) continue;
@@ -735,7 +319,7 @@ void CUDAInterface::conv_forward_cudnn(
             CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, perf[i].mathType));
             picked = true;
         }
-        for (int i = 0; i < returned && !picked; ++i) {  // fallback: any success
+        for (int i = 0; i < returned && !picked; ++i) {
             if (perf[i].status != CUDNN_STATUS_SUCCESS) continue;
             cudnnAlgo = perf[i].algo;
             CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, perf[i].mathType));

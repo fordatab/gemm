@@ -14,6 +14,18 @@ CUDA_LIB  = -L"$(CUDA_PATH)/lib64" -lcudart -lcublas -lcudnn
 LDFLAGS += $(CUDA_LIB)
 INCFLAGS += $(CUDA_INC)
 
+KERNEL_DIR  = src/layer/kernel
+KERNEL_SRCS = $(KERNEL_DIR)/new-forward.cu \
+              $(KERNEL_DIR)/im2col_kernel.cu \
+              $(KERNEL_DIR)/conv_forward_direct_naive_kernel.cu \
+              $(KERNEL_DIR)/conv_forward_direct_tiled_kernel.cu \
+              $(KERNEL_DIR)/conv_forward_direct_coarse_kernel.cu \
+              $(KERNEL_DIR)/conv_forward_direct_spec_kernel.cu \
+              $(KERNEL_DIR)/conv_forward_c1_kernel.cu
+KERNEL_HDRS = $(KERNEL_DIR)/gpu-utils.cuh \
+              $(KERNEL_DIR)/conv_kernel_common.cuh \
+              $(KERNEL_DIR)/conv_kernels.cuh
+
 all: modern
 
 # Modern VGG-style network.
@@ -48,8 +60,14 @@ layer.sentinel:		src/layer/conv.cc src/layer/ave_pooling.cc src/layer/fully_conn
 		$(CC) $(CFLAGS) -c src/layer/softmax.cc -o src/layer/softmax.o $(INCFLAGS)
 		touch layer.sentinel
 
-cuda.sentinel: src/layer/kernel/new-forward.cu src/layer/kernel/gpu-utils.cuh src/layer/conv_cust.cc
-		$(NVCC) $(NVCCFLAGS) -c src/layer/kernel/new-forward.cu -o src/layer/kernel/new-forward.o $(INCFLAGS)
+cuda.sentinel: $(KERNEL_SRCS) $(KERNEL_HDRS) src/layer/conv_cust.cc
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/new-forward.cu -o $(KERNEL_DIR)/new-forward.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/im2col_kernel.cu -o $(KERNEL_DIR)/im2col_kernel.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/conv_forward_direct_naive_kernel.cu -o $(KERNEL_DIR)/conv_forward_direct_naive_kernel.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/conv_forward_direct_tiled_kernel.cu -o $(KERNEL_DIR)/conv_forward_direct_tiled_kernel.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/conv_forward_direct_coarse_kernel.cu -o $(KERNEL_DIR)/conv_forward_direct_coarse_kernel.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/conv_forward_direct_spec_kernel.cu -o $(KERNEL_DIR)/conv_forward_direct_spec_kernel.o $(INCFLAGS)
+		$(NVCC) $(NVCCFLAGS) -c $(KERNEL_DIR)/conv_forward_c1_kernel.cu -o $(KERNEL_DIR)/conv_forward_c1_kernel.o $(INCFLAGS)
 		$(NVCC) $(NVCCFLAGS) -x cu -c src/layer/conv_cust.cc -o src/layer/conv_cust.o $(INCFLAGS)
 		touch cuda.sentinel
 
