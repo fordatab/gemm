@@ -38,6 +38,10 @@ def parse_args(argv):
                    help="untimed warmup runs before timing (default: 0)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="suppress the child's stdout/stderr")
+    p.add_argument("--lock-clocks", type=int, metavar="MHz", default=None,
+                   help="lock the GPU graphics clock to MHz via nvidia-smi for the "
+                        "duration of profiling (best effort; needs privileges). "
+                        "Removes DVFS/boost jitter. Reset automatically afterwards.")
     p.add_argument("--args", nargs=argparse.REMAINDER, default=[],
                    help="command to profile; must be the LAST flag")
     a = p.parse_args(argv)
@@ -61,6 +65,39 @@ def peak_rss_kb():
     return val
 
 
+def _nvidia_smi(args):
+    """Run `nvidia-smi <args>`; return (ok, output). Never raises."""
+    try:
+        r = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return False, "nvidia-smi not found"
+
+
+def lock_clocks(mhz):
+    """Best-effort: enable persistence mode and lock the graphics clock to `mhz`.
+
+    Returns True if the lock was applied (so the caller knows to reset it). Prints
+    a warning and returns False on failure (e.g. no privileges, WSL restriction).
+    """
+    _nvidia_smi(["-pm", "1"])  # persistence mode; ignore failure
+    ok, out = _nvidia_smi(["-lgc", str(mhz)])
+    if ok:
+        print(f"locked GPU graphics clock to {mhz} MHz", file=sys.stderr)
+    else:
+        print(f"WARNING: could not lock GPU clocks ({out}); "
+              f"continuing without lock", file=sys.stderr)
+    return ok
+
+
+def reset_clocks():
+    ok, out = _nvidia_smi(["-rgc"])
+    if ok:
+        print("reset GPU graphics clock to default", file=sys.stderr)
+    else:
+        print(f"WARNING: could not reset GPU clocks ({out})", file=sys.stderr)
+
+
 def run_once(cmd, quiet):
     start = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -77,24 +114,32 @@ def main(argv=None):
     cmd = a.args
     print(f"Profiling: {' '.join(cmd)}", file=sys.stderr)
 
-    for i in range(a.warmup):
-        print(f"  warmup {i + 1}/{a.warmup} ...", file=sys.stderr)
-        _, _, rc = run_once(cmd, quiet=True)
-        if rc != 0:
-            print(f"warmup run failed (exit {rc})", file=sys.stderr)
-            return rc
+    locked = False
+    if a.lock_clocks is not None:
+        locked = lock_clocks(a.lock_clocks)
 
-    walls = []
-    last_output = ""
-    for i in range(a.runs):
-        if a.runs > 1:
-            print(f"  run {i + 1}/{a.runs} ...", file=sys.stderr)
-        elapsed, output, rc = run_once(cmd, a.quiet)
-        if rc != 0:
-            print(f"command failed (exit {rc})", file=sys.stderr)
-            return rc
-        walls.append(elapsed)
-        last_output = output
+    try:
+        for i in range(a.warmup):
+            print(f"  warmup {i + 1}/{a.warmup} ...", file=sys.stderr)
+            _, _, rc = run_once(cmd, quiet=True)
+            if rc != 0:
+                print(f"warmup run failed (exit {rc})", file=sys.stderr)
+                return rc
+
+        walls = []
+        last_output = ""
+        for i in range(a.runs):
+            if a.runs > 1:
+                print(f"  run {i + 1}/{a.runs} ...", file=sys.stderr)
+            elapsed, output, rc = run_once(cmd, a.quiet)
+            if rc != 0:
+                print(f"command failed (exit {rc})", file=sys.stderr)
+                return rc
+            walls.append(elapsed)
+            last_output = output
+    finally:
+        if locked:
+            reset_clocks()
 
     layers = [float(x) for x in LAYER_RE.findall(last_output)]
     ops = [float(x) for x in OP_RE.findall(last_output)]
@@ -115,7 +160,9 @@ def main(argv=None):
         print(f"peak rss     : {peak / 1024:.1f} MiB")
 
     if layers:
-        print(f"\nper-conv-layer timing (last run, {len(layers)} layers):")
+        # GPU inference modes emit one median-per-layer line (median over the
+        # binary's in-process --iters); for other commands these are last-run values.
+        print(f"\nper-conv-layer timing ({len(layers)} layers):")
         for i, (lt, ot) in enumerate(zip(layers, ops or [float('nan')] * len(layers))):
             print(f"  layer {i}: layer {lt:8.2f} ms | op {ot:8.2f} ms")
         print(f"  total  : layer {sum(layers):8.2f} ms | op {sum(ops):8.2f} ms")

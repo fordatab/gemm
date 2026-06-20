@@ -20,6 +20,8 @@ Usage:
 """
 
 import argparse
+import time
+from statistics import median
 
 import torch
 import torch.nn as nn
@@ -94,6 +96,91 @@ def evaluate(model, loader, device):
     return correct / total
 
 
+def _split_blocks(features):
+    """Group the feature extractor into [conv, relu, pool] blocks (one per conv).
+
+    Returns a list of nn.Sequential blocks, each starting with the Conv2d so we
+    can time the conv (``Op Time``) separately from the whole block (``Layer Time``).
+    """
+    blocks, cur = [], []
+    for m in features:
+        cur.append(m)
+        if isinstance(m, nn.MaxPool2d):
+            blocks.append(nn.Sequential(*cur))
+            cur = []
+    if cur:
+        blocks.append(nn.Sequential(*cur))
+    return blocks
+
+
+@torch.inference_mode()
+def profile(args):
+    """Time the forward pass per conv-layer, emitting lines that utils/profile.py parses.
+
+    Runs in-process for ``--iters`` timed iterations (after ``--warmup`` untimed
+    ones) and prints the *median* per-layer ``Layer Time:`` / ``Op Time:`` line,
+    matching the `modern` binary's GPU inference output so the same harness
+    summarizes both. ``Layer Time`` is conv+ReLU+pool; ``Op Time`` is conv only.
+    """
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("ERROR: --device cuda requested but torch.cuda.is_available() "
+                         "is False (you likely have the +cpu build of torch installed).")
+    print(f"Device: {device}", flush=True)
+
+    model = ModernNet().to(device).eval()
+    if args.weights:
+        model.load_state_dict(torch.load(args.weights, map_location=device))
+
+    blocks = _split_blocks(model.features)
+    x = torch.rand(args.batch, 1, 86, 86, device=device)
+
+    def sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    def run_forward(record=None):
+        """Forward x through the net. If `record` (layer/op sample lists) is given,
+        time each conv (op) and each block (layer) with proper device sync."""
+        inp = x
+        for bi, block in enumerate(blocks):
+            if record is None:
+                inp = block(inp)
+                continue
+            layer_s, op_s = record
+            sync(); t0 = time.perf_counter()
+            out = block[0](inp)                       # conv only
+            sync(); op_s[bi].append((time.perf_counter() - t0) * 1000)
+            for m in list(block)[1:]:                 # relu, pool
+                out = m(out)
+            sync(); layer_s[bi].append((time.perf_counter() - t0) * 1000)
+            inp = out
+        return model.classifier(torch.flatten(inp, 1))
+
+    for _ in range(args.warmup):
+        run_forward()
+    sync()
+
+    n = len(blocks)
+    layer_s = [[] for _ in range(n)]
+    op_s = [[] for _ in range(n)]
+    walls = []
+    for _ in range(args.iters):
+        sync(); w0 = time.perf_counter()
+        run_forward(record=(layer_s, op_s))
+        sync(); walls.append((time.perf_counter() - w0) * 1000)
+
+    # Interleaved so utils/profile.py zips Layer/Op by index.
+    for bi in range(n):
+        print(f"Layer Time: {median(layer_s[bi]):.3f} ms")
+        print(f"Op Time: {median(op_s[bi]):.3f} ms")
+    print(f"\nbatch {args.batch} | {args.iters} iters (+{args.warmup} warmup) | "
+          f"median forward wall: {median(walls):.3f} ms", flush=True)
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -139,7 +226,23 @@ def main():
     p.add_argument("--out", type=str, default="./build/modern-weights-torch.pt")
     p.add_argument("--summary", action="store_true",
                    help="print model and parameter count, then exit")
+    p.add_argument("--profile", action="store_true",
+                   help="time the forward pass per layer (emits Layer Time/Op Time "
+                        "lines for utils/profile.py) and exit")
+    p.add_argument("--iters", type=int, default=50,
+                   help="timed forward iterations in --profile mode (default: 50)")
+    p.add_argument("--warmup", type=int, default=10,
+                   help="untimed warmup iterations in --profile mode (default: 10)")
+    p.add_argument("--device", type=str, default=None,
+                   help="force device for --profile (e.g. cuda, cpu); "
+                        "default: cuda if available else cpu")
+    p.add_argument("--weights", type=str, default=None,
+                   help="optional state_dict to load before --profile")
     args = p.parse_args()
+
+    if args.profile:
+        profile(args)
+        return
 
     if args.summary:
         model = ModernNet()
