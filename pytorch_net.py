@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from statistics import median
 
@@ -27,6 +28,82 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+
+# --- Custom CUDA conv kernels (forward only) --------------------------------
+# Build/JIT-load the extension that wraps this repo's direct conv kernels and
+# swap it in for nn.Conv2d, so PyTorch's forward pass runs our kernels instead
+# of cuDNN. Forward only -> use under torch.inference_mode() (i.e. --profile).
+_CUSTOM_EXT = None
+
+
+def _load_custom_ext():
+    """JIT-compile + load the custom conv extension once (cached)."""
+    global _CUSTOM_EXT
+    if _CUSTOM_EXT is not None:
+        return _CUSTOM_EXT
+    from torch.utils.cpp_extension import load
+    here = os.path.dirname(os.path.abspath(__file__))
+    kdir = os.path.join(here, "src", "layer", "kernel")
+    _CUSTOM_EXT = load(
+        name="myconv",
+        sources=[
+            os.path.join(here, "torch_conv.cu"),
+            os.path.join(kdir, "conv_forward_c1_kernel.cu"),
+            os.path.join(kdir, "conv_forward_c1_bias_kernel.cu"),
+            os.path.join(kdir, "conv_forward_direct_spec_kernel.cu"),
+            os.path.join(kdir, "conv_forward_direct_coarse_kernel.cu"),
+        ],
+        extra_include_paths=[kdir],
+        extra_cuda_cflags=["-O3"],  # NOT -march=native (AVX segfault per build notes)
+        verbose=True,
+    )
+    return _CUSTOM_EXT
+
+
+class CustomConv2d(nn.Module):
+    """Drop-in replacement for nn.Conv2d that calls the custom forward kernel.
+
+    Holds the same weight (and optional bias) so a state_dict trained against
+    nn.Conv2d loads and runs identically (the kernel does valid conv, stride 1,
+    no bias; bias -- if present -- is added back here).
+    """
+
+    def __init__(self, ext, weight, bias=None):
+        super().__init__()
+        self.ext = ext
+        # Buffers, not Parameters: forward only, and this is built under
+        # torch.inference_mode() where Parameters (requires_grad) are illegal.
+        self.register_buffer("weight", weight.detach().clone())
+        self.register_buffer("bias", bias.detach().clone() if bias is not None else None)
+
+    @classmethod
+    def from_conv2d(cls, conv: nn.Conv2d, ext):
+        assert conv.stride == (1, 1) and conv.padding == (0, 0), \
+            "custom kernel only supports stride 1, no padding"
+        b = conv.bias.data if conv.bias is not None else None
+        return cls(ext, conv.weight.data, b)
+
+    def forward(self, x):
+        # Bias is fused into the kernel's store (the fused c1 kernel adds bias[m]
+        # before writing). This avoids a separate full-tensor `y += bias` pass,
+        # which on a large output (903 MB at batch 2000) was the dominant
+        # non-kernel cost of the op and -- when done out-of-place -- doubled VRAM
+        # and triggered allocator thrashing on the 2 GB GPU.
+        return self.ext.conv_forward(x.contiguous(), self.weight, self.bias)
+
+
+def _swap_custom_convs(model, ext):
+    """HYBRID swap: only the first conv (C=1) goes to the custom c1 kernel; the
+    deeper convs (more channels) stay on nn.Conv2d / cuDNN, which beats the direct
+    kernels there. Mirrors ConvMethod::HYBRID in the C++ network."""
+    feats = model.features
+    n = 0
+    for i, m in enumerate(feats):
+        if isinstance(m, nn.Conv2d) and m.in_channels == 1:
+            feats[i] = CustomConv2d.from_conv2d(m, ext)  # nn.Sequential.__setitem__
+            n += 1
+    return n
 
 
 class ModernNet(nn.Module):
@@ -148,6 +225,17 @@ def profile(args):
     if args.weights:
         model.load_state_dict(torch.load(args.weights, map_location=device))
 
+    if args.custom:
+        if device.type != "cuda":
+            raise SystemExit("ERROR: --custom requires a CUDA device.")
+        ext = _load_custom_ext()
+        n = _swap_custom_convs(model, ext)
+        model.to(device).eval()
+        print(f"Custom kernels: HYBRID ({n} C=1 conv on custom c1 kernel, "
+              f"deeper convs on cuDNN)", flush=True)
+    else:
+        print("Custom kernels: OFF (using cuDNN nn.Conv2d)", flush=True)
+
     blocks = _split_blocks(model.features)
     x = torch.rand(args.batch, 1, 86, 86, device=device)
 
@@ -257,6 +345,9 @@ def main():
     p.add_argument("--cudnn-benchmark", action="store_true",
                    help="enable cuDNN autotuning (per-shape best algorithm) in --profile "
                         "-- the strongest, fairest cuDNN baseline for fixed-shape inference")
+    p.add_argument("--custom", action="store_true",
+                   help="swap nn.Conv2d for the repo's custom CUDA conv kernels in "
+                        "--profile (forward only; JIT-compiles torch_conv.cu on first use)")
     args = p.parse_args()
 
     if args.profile:

@@ -38,4 +38,12 @@ __global__ void conv_forward_c1_kernel(float *y, const float *__restrict__ x,
                                        const int B, const int M,
                                        const int H, const int W);
 
+// As above, but folds a per-output-channel bias into the store (used by the
+// PyTorch path so the bias add isn't a separate full-tensor pass).
+__global__ void conv_forward_c1_bias_kernel(float *y, const float *__restrict__ x,
+                                            const float *__restrict__ k,
+                                            const float *__restrict__ bias,
+                                            const int B, const int M,
+                                            const int H, const int W);
+
 #endif // SRC_LAYER_KERNEL_CONV_KERNELS_CUH

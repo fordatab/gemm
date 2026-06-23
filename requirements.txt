@@ -1,0 +1,11 @@
+# Python deps for pytorch_net.py (run in WSL with a CUDA-capable GPU).
+#
+# torch/torchvision: the default PyPI Linux wheels are CUDA-enabled. If you need
+# a specific CUDA version, install torch from the PyTorch index instead, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# then `pip install -r requirements.txt` for the rest.
+
+torch>=2.1
+torchvision>=0.16
+ninja>=1.11        # required by torch.utils.cpp_extension to build torch_conv.cu
+numpy>=1.24

@@ -5,3 +5,12 @@ m2
 data/*
 .idea/
 __pycache__/
+
+# Build artifacts
+*.pdb
+*.pt
+*.deb
+build/
+out.txt
+modern
+.claude/
